@@ -3,7 +3,8 @@ from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from backend.database.session import engine, Base
-from backend.routers import auth, courses, outline, materials
+from backend.routers import auth, courses, outline, materials, questions
+from backend.services import web_search_agent
 
 # Tự động tạo bảng SQLite khi chạy lần đầu nếu chưa tồn tại
 Base.metadata.create_all(bind=engine)
@@ -28,6 +29,8 @@ app.include_router(auth.router)
 app.include_router(courses.router)
 app.include_router(outline.router)
 app.include_router(materials.router)
+app.include_router(questions.router)
+app.include_router(web_search_agent.router)
 
 # Root Endpoint
 @app.get("/")

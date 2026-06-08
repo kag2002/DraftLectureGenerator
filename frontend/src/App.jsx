@@ -3,10 +3,12 @@ import Login from './pages/Login';
 import Dashboard from './pages/Dashboard';
 import CourseConfig from './pages/CourseConfig';
 import LessonPlanner from './pages/LessonPlanner';
+import QuestionBank from './pages/QuestionBank';
+import MatrixDashboard from './pages/MatrixDashboard';
 
 export default function App() {
   const [user, setUser] = useState(null);
-  const [activeView, setActiveView] = useState('login'); // 'login' | 'dashboard' | 'course_config' | 'lesson_planner'
+  const [activeView, setActiveView] = useState('login'); // 'login' | 'dashboard' | 'course_config' | 'lesson_planner' | 'question_bank' | 'matrix_dashboard'
   const [selectedCourse, setSelectedCourse] = useState(null);
   const [loading, setLoading] = useState(true);
 
@@ -74,6 +76,20 @@ export default function App() {
           course={selectedCourse}
           onBack={() => setActiveView('course_config')}
           onLogout={handleLogout}
+          onGoToQuestionBank={() => setActiveView('question_bank')}
+        />
+      )}
+      {activeView === 'question_bank' && (
+        <QuestionBank
+          course={selectedCourse}
+          onBack={() => setActiveView('lesson_planner')}
+          onViewDashboard={() => setActiveView('matrix_dashboard')}
+        />
+      )}
+      {activeView === 'matrix_dashboard' && (
+        <MatrixDashboard
+          course={selectedCourse}
+          onBack={() => setActiveView('question_bank')}
         />
       )}
     </>

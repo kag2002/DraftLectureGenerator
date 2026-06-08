@@ -1,7 +1,4 @@
-import React, { useState, useEffect } from 'react';
-import client from '../api/client';
-
-export default function LessonPlanner({ course, onBack }) {
+export default function LessonPlanner({ course, onBack, onGoToQuestionBank }) {
   // Navigation & States
   const [chapters, setChapters] = useState([]);
   const [selectedChapter, setSelectedChapter] = useState(null);
@@ -208,6 +205,9 @@ export default function LessonPlanner({ course, onBack }) {
             <span style={styles.badge}>{course.course_code}</span>
             <h2 style={styles.courseTitle}>{course.course_name}</h2>
           </div>
+          <button onClick={onGoToQuestionBank} style={styles.questionBankBtn}>
+            📝 Soạn Đề thi (AI Questions)
+          </button>
         </div>
 
         {/* MONITORING API BADGE */}
@@ -472,6 +472,18 @@ const styles = {
     cursor: 'pointer',
     fontSize: '12px',
     fontWeight: '600',
+  },
+  questionBankBtn: {
+    background: 'rgba(99, 102, 241, 0.1)',
+    border: '1px solid rgba(99, 102, 241, 0.3)',
+    color: '#a5b4fc',
+    borderRadius: '8px',
+    padding: '6px 12px',
+    cursor: 'pointer',
+    fontSize: '12px',
+    fontWeight: '600',
+    marginLeft: '15px',
+    transition: 'background 0.2s',
   },
   badge: {
     background: 'rgba(99, 102, 241, 0.15)',
