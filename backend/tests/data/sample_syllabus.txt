@@ -1,0 +1,9 @@
+COURSE SYLLABUS: COMP2010 - Data Structures and Algorithms
+
+Description: This course introduces core data structures and algorithm analysis.
+
+Course Learning Outcomes:
+By the end of this course, students will:
+1. Understand the working principles of Binary Search Trees (BST) and how they organize keys.
+2. Apply Python programming to implement tree search, insertion, and deletion algorithms.
+3. Compare the time complexity of unbalanced BSTs with self-balancing AVL trees under worst-case scenarios.

@@ -1,9 +1,11 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, Field
 from backend.database.session import get_db
 from backend.database.models import Course, CLO, User
 from backend.auth import get_current_user
+import shutil
+import os
 
 router = APIRouter(prefix="/api/courses", tags=["courses"])
 
@@ -142,3 +144,98 @@ def delete_clo(clo_id: int, current_user: User = Depends(get_current_user), db: 
     db.delete(clo)
     db.commit()
     return {"message": "Đã xóa chuẩn đầu ra thành công."}
+
+@router.post("/{course_id}/parse-syllabus")
+def upload_and_parse_syllabus(
+    course_id: int, 
+    file: UploadFile = File(...), 
+    current_user: User = Depends(get_current_user), 
+    db: Session = Depends(get_db)
+):
+    # 1. Kiểm tra quyền sở hữu môn học
+    course = db.query(Course).filter(Course.id == course_id, Course.user_id == current_user.id).first()
+    if not course:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Môn học không tồn tại hoặc bạn không có quyền truy cập."
+        )
+        
+    # 2. Tạo thư mục tạm lưu file
+    temp_dir = "./temp"
+    os.makedirs(temp_dir, exist_ok=True)
+    temp_file_path = os.path.join(temp_dir, file.filename)
+    
+    try:
+        # Lưu file tạm xuống đĩa
+        with open(temp_file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+            
+        # 3. Trích xuất text từ file đề cương
+        from backend.utils.parser import parse_document
+        from backend.services.syllabus_analyser import analyse_syllabus
+        
+        text_content = parse_document(temp_file_path)
+        if not text_content:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Không thể đọc nội dung từ file đề cương tải lên."
+            )
+            
+        # 4. LLM bóc tách thông tin cấu trúc & CLOs
+        analysis_result = analyse_syllabus(text_content)
+        
+        # 5. Cập nhật thông tin mã/tên môn học nếu được trả về
+        if "course_code" in analysis_result and analysis_result["course_code"]:
+            course.course_code = analysis_result["course_code"]
+        if "course_name" in analysis_result and analysis_result["course_name"]:
+            course.course_name = analysis_result["course_name"]
+            
+        # Xóa các CLOs cũ của môn này để tránh trùng lặp ghi đè
+        db.query(CLO).filter(CLO.course_id == course_id).delete()
+        
+        # Thêm các CLOs mới đã bóc tách
+        created_clos = []
+        for clo_item in analysis_result.get("clos", []):
+            new_clo = CLO(
+                course_id=course_id,
+                clo_code=clo_item.get("clo_code", "CLO"),
+                description=clo_item.get("description", ""),
+                bloom_level=clo_item.get("bloom_level", 2)
+            )
+            db.add(new_clo)
+            created_clos.append(new_clo)
+            
+        db.commit()
+        
+        # Trả về kết quả JSON đã nạp
+        return {
+            "message": "Phân tích Syllabus thành công.",
+            "course": {
+                "id": course.id,
+                "course_code": course.course_code,
+                "course_name": course.course_name
+            },
+            "clos": [
+                {
+                    "id": c.id,
+                    "clo_code": c.clo_code,
+                    "description": c.description,
+                    "bloom_level": c.bloom_level
+                }
+                for c in created_clos
+            ]
+        }
+        
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Lỗi hệ thống khi phân tích Syllabus: {str(e)}"
+        )
+    finally:
+        # Xóa file tạm sau khi hoàn tất
+        if os.path.exists(temp_file_path):
+            try:
+                os.remove(temp_file_path)
+            except Exception:
+                pass
