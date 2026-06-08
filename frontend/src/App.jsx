@@ -2,10 +2,11 @@ import React, { useState, useEffect } from 'react';
 import Login from './pages/Login';
 import Dashboard from './pages/Dashboard';
 import CourseConfig from './pages/CourseConfig';
+import LessonPlanner from './pages/LessonPlanner';
 
 export default function App() {
   const [user, setUser] = useState(null);
-  const [activeView, setActiveView] = useState('login'); // 'login' | 'dashboard' | 'course_config'
+  const [activeView, setActiveView] = useState('login'); // 'login' | 'dashboard' | 'course_config' | 'lesson_planner'
   const [selectedCourse, setSelectedCourse] = useState(null);
   const [loading, setLoading] = useState(true);
 
@@ -65,6 +66,14 @@ export default function App() {
         <CourseConfig
           course={selectedCourse}
           onBack={() => setActiveView('dashboard')}
+          onStartPlanning={() => setActiveView('lesson_planner')}
+        />
+      )}
+      {activeView === 'lesson_planner' && (
+        <LessonPlanner
+          course={selectedCourse}
+          onBack={() => setActiveView('course_config')}
+          onLogout={handleLogout}
         />
       )}
     </>

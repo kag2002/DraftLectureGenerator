@@ -239,3 +239,147 @@ def upload_and_parse_syllabus(
                 os.remove(temp_file_path)
             except Exception:
                 pass
+
+# --- API QUẢN LÝ TÀI LIỆU THAM CHIẾU (RAG DOCUMENTS) ---
+
+@router.post("/{course_id}/documents")
+def upload_course_document(
+    course_id: int, 
+    file: UploadFile = File(...), 
+    current_user: User = Depends(get_current_user), 
+    db: Session = Depends(get_db)
+):
+    # 1. Kiểm tra quyền sở hữu môn học
+    course = db.query(Course).filter(Course.id == course_id, Course.user_id == current_user.id).first()
+    if not course:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Môn học không tồn tại hoặc bạn không có quyền truy cập."
+        )
+        
+    # 2. Tạo thư mục tạm lưu file
+    temp_dir = "./temp"
+    os.makedirs(temp_dir, exist_ok=True)
+    temp_file_path = os.path.join(temp_dir, file.filename)
+    
+    try:
+        # Lưu file tạm xuống đĩa
+        with open(temp_file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+            
+        # 3. Trích xuất văn bản theo trang
+        from backend.utils.parser import parse_document
+        text_by_pages = []
+        
+        _, ext = os.path.splitext(file.filename.lower())
+        if ext == ".pdf":
+            import pdfplumber
+            with pdfplumber.open(temp_file_path) as pdf:
+                for page in pdf.pages:
+                    text_by_pages.append(page.extract_text() or "")
+        else:
+            # Với Word hoặc Txt, parse toàn bộ và gán cho trang 1
+            text_content = parse_document(temp_file_path)
+            text_by_pages = [text_content]
+            
+        if not text_by_pages or all(not t.strip() for t in text_by_pages):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Không thể đọc nội dung văn bản từ tài liệu tải lên."
+            )
+            
+        # 4. Nạp các chunks vào ChromaDB
+        from backend.database.vector_db import add_document_vector
+        add_document_vector(file.filename, text_by_pages, user_id=current_user.id, course_id=course_id)
+        
+        return {
+            "message": f"Tải lên và nạp tài liệu RAG '{file.filename}' thành công.",
+            "file_name": file.filename,
+            "total_pages": len(text_by_pages)
+        }
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Lỗi khi tải tài liệu lên RAG: {str(e)}"
+        )
+    finally:
+        # Xóa file tạm
+        if os.path.exists(temp_file_path):
+            try:
+                os.remove(temp_file_path)
+            except Exception:
+                pass
+
+@router.get("/{course_id}/documents")
+def get_course_documents(
+    course_id: int, 
+    current_user: User = Depends(get_current_user), 
+    db: Session = Depends(get_db)
+):
+    # Kiểm tra quyền môn học trước
+    course = db.query(Course).filter(Course.id == course_id, Course.user_id == current_user.id).first()
+    if not course:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Môn học không tồn tại hoặc bạn không có quyền truy cập."
+        )
+        
+    from backend.database.vector_db import collection
+    try:
+        # Lấy metadatas của các vector thuộc môn học và user này để lọc ra file_name độc nhất
+        data = collection.get(
+            where={
+                "$and": [
+                    {"user_id": {"$eq": current_user.id}},
+                    {"course_id": {"$eq": course_id}}
+                ]
+            },
+            include=["metadatas"]
+        )
+        
+        file_names = set()
+        if data and data["metadatas"]:
+            for meta in data["metadatas"]:
+                if "file_name" in meta:
+                    file_names.add(meta["file_name"])
+                    
+        return {"documents": list(file_names)}
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Lỗi khi lấy danh sách tài liệu: {str(e)}"
+        )
+
+@router.delete("/{course_id}/documents/{file_name}")
+def delete_course_document(
+    course_id: int, 
+    file_name: str, 
+    current_user: User = Depends(get_current_user), 
+    db: Session = Depends(get_db)
+):
+    course = db.query(Course).filter(Course.id == course_id, Course.user_id == current_user.id).first()
+    if not course:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Môn học không tồn tại hoặc bạn không có quyền truy cập."
+        )
+        
+    from backend.database.vector_db import collection
+    try:
+        # Xóa các vector của file này khỏi ChromaDB
+        collection.delete(
+            where={
+                "$and": [
+                    {"user_id": {"$eq": current_user.id}},
+                    {"course_id": {"$eq": course_id}},
+                    {"file_name": {"$eq": file_name}}
+                ]
+            }
+        )
+        return {"message": f"Đã xóa thành công tài liệu '{file_name}' khỏi RAG."}
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Lỗi khi xóa tài liệu RAG: {str(e)}"
+        )

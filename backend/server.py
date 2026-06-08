@@ -3,7 +3,7 @@ from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from backend.database.session import engine, Base
-from backend.routers import auth, courses
+from backend.routers import auth, courses, outline, materials
 
 # Tự động tạo bảng SQLite khi chạy lần đầu nếu chưa tồn tại
 Base.metadata.create_all(bind=engine)
@@ -26,6 +26,8 @@ app.add_middleware(
 # Tích hợp các bộ định tuyến API (Routers)
 app.include_router(auth.router)
 app.include_router(courses.router)
+app.include_router(outline.router)
+app.include_router(materials.router)
 
 # Root Endpoint
 @app.get("/")

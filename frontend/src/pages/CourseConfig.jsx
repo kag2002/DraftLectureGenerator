@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import client from '../api/client';
 
-export default function CourseConfig({ course, onBack }) {
+export default function CourseConfig({ course, onBack, onStartPlanning }) {
   const [clos, setClos] = useState([]);
   const [file, setFile] = useState(null);
   const [rawText, setRawText] = useState('');
@@ -135,10 +135,17 @@ export default function CourseConfig({ course, onBack }) {
   return (
     <div style={styles.container}>
       <header style={styles.header}>
-        <button onClick={onBack} style={styles.backBtn}>← Quay lại Dashboard</button>
+        <div style={styles.headerLeft}>
+          <button onClick={onBack} style={styles.backBtn}>← Quay lại Dashboard</button>
+          <div>
+            <span style={styles.badge}>{course.course_code}</span>
+            <h2 style={styles.courseTitle}>{course.course_name}</h2>
+          </div>
+        </div>
         <div>
-          <span style={styles.badge}>{course.course_code}</span>
-          <h2 style={styles.courseTitle}>{course.course_name}</h2>
+          <button onClick={onStartPlanning} style={styles.startPlanningBtn}>
+            Bắt đầu soạn bài (AI Planner) →
+          </button>
         </div>
       </header>
 
@@ -279,10 +286,27 @@ const styles = {
   header: {
     display: 'flex',
     alignItems: 'center',
-    gap: '20px',
+    justifyContent: 'space-between',
     borderBottom: '1px solid rgba(255, 255, 255, 0.08)',
     paddingBottom: '20px',
     marginBottom: '35px',
+  },
+  headerLeft: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '20px',
+  },
+  startPlanningBtn: {
+    background: 'linear-gradient(135deg, #6366f1 0%, #a855f7 100%)',
+    color: '#ffffff',
+    border: 'none',
+    borderRadius: '10px',
+    padding: '10px 20px',
+    fontSize: '14px',
+    fontWeight: '700',
+    cursor: 'pointer',
+    boxShadow: '0 4px 12px rgba(99, 102, 241, 0.3)',
+    transition: 'transform 0.2s, box-shadow 0.2s',
   },
   backBtn: {
     background: 'rgba(255, 255, 255, 0.05)',
