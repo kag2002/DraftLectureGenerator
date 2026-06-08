@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.venv
+venv/
+ENV/
+lecture_generator.db
+backend/lecture_generator.db
+lecture_generator.db-journal
+lecture_generator.db-wal
+lecture_generator.db-shm
+
+# Node / React
+node_modules/
+dist/
+.npm
+package-lock.json
+frontend/node_modules/
+frontend/dist/
+
+# Vector DB
+backend/data/chroma_db/
+backend/data/vector_db/
+
+# IDEs
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
