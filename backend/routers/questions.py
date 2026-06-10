@@ -1,12 +1,25 @@
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, Field
 import json
-from backend.database.session import get_db
-from backend.database.models import Course, CLO, Chapter, Question, User
+import asyncio
+from backend.database.session import get_db, SessionLocal
+from backend.database.models import Course, CLO, Chapter, Question, User, ChapterMaterial
 from backend.auth import get_current_user
 from backend.database.vector_db import search_rag_isolated
-from backend.utils.llm_client import call_llm_json
+from backend.utils.llm_client import call_llm_json, langfuse
+import datetime
+from backend.prompts.questions import (
+    build_generator_system_prompt,
+    build_generator_system_prompt_compact,
+    build_generator_user_prompt,
+    build_generator_user_prompt_compact,
+    build_solver_prompt,
+    build_correction_prompt,
+    SOLVER_SYSTEM_PROMPT,
+    SOLVER_SYSTEM_PROMPT_COMPACT,
+)
 
 router = APIRouter(prefix="/api/courses", tags=["questions"])
 
@@ -15,7 +28,16 @@ class QuestionGenerateRequest(BaseModel):
     clo_id: int | None = Field(None, description="ID của CLO mục tiêu")
     chapter_id: int | None = Field(None, description="ID của chương học")
     bloom_level: int = Field(3, ge=1, le=6, description="Mức độ Bloom từ 1 đến 6")
-    count: int = Field(2, ge=1, le=10, description="Số lượng câu hỏi cần sinh")
+    count: int = Field(5, ge=1, le=10, description="Số lượng câu hỏi cần sinh")
+    fast_mode: bool = Field(False, description="Nếu True, bỏ qua bước Self-Correction để sinh câu hỏi nhanh chóng")
+
+class QuestionCreateRequest(BaseModel):
+    chapter_id: int | None = Field(None, description="ID của chương học")
+    question_text: str = Field(..., description="Nội dung câu hỏi")
+    options_json: str = Field(..., description="Mảng các lựa chọn dưới dạng JSON string")
+    correct_answer: str = Field(..., description="Đáp án đúng")
+    bloom_level: int = Field(..., ge=1, le=6, description="Mức Bloom")
+    clo_id: int | None = Field(None, description="ID CLO liên kết")
 
 class QuestionUpdateRequest(BaseModel):
     question_text: str = Field(..., description="Nội dung câu hỏi")
@@ -23,6 +45,7 @@ class QuestionUpdateRequest(BaseModel):
     correct_answer: str = Field(..., description="Đáp án đúng")
     bloom_level: int = Field(..., ge=1, le=6, description="Mức Bloom")
     clo_id: int | None = Field(None, description="ID CLO liên kết")
+
 
 class QuestionResponse(BaseModel):
     id: int
@@ -51,6 +74,56 @@ def get_course_questions(course_id: int, current_user: User = Depends(get_curren
             detail="Môn học không tồn tại hoặc bạn không có quyền truy cập."
         )
     return db.query(Question).filter(Question.course_id == course_id).all()
+
+@router.post("/{course_id}/questions", response_model=QuestionResponse, status_code=status.HTTP_201_CREATED)
+def create_question(
+    course_id: int,
+    req: QuestionCreateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    # 1. Xác thực quyền sở hữu môn học
+    course = db.query(Course).filter(Course.id == course_id, Course.user_id == current_user.id).first()
+    if not course:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Môn học không tồn tại hoặc bạn không có quyền truy cập."
+        )
+
+    # 2. Xác thực chapter nếu có truyền vào
+    if req.chapter_id is not None:
+        chapter = db.query(Chapter).filter(Chapter.id == req.chapter_id, Chapter.course_id == course_id).first()
+        if not chapter:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Chương học không thuộc môn học này."
+            )
+
+    # 3. Xác thực CLO nếu có truyền vào
+    if req.clo_id is not None:
+        clo = db.query(CLO).filter(CLO.id == req.clo_id, CLO.course_id == course_id).first()
+        if not clo:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="CLO không thuộc môn học này."
+            )
+
+    new_q = Question(
+        course_id=course_id,
+        chapter_id=req.chapter_id,
+        question_text=req.question_text,
+        question_type="MCQ",
+        options_json=req.options_json,
+        correct_answer=req.correct_answer,
+        bloom_level=req.bloom_level,
+        clo_id=req.clo_id,
+        is_active=True
+    )
+    db.add(new_q)
+    db.commit()
+    db.refresh(new_q)
+    return new_q
+
 
 @router.put("/questions/{question_id}", response_model=QuestionResponse)
 def update_question(question_id: int, req: QuestionUpdateRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -85,6 +158,21 @@ def delete_question(question_id: int, current_user: User = Depends(get_current_u
     db.commit()
     return {"message": "Đã xóa câu hỏi thành công."}
 
+@router.get("/questions/{question_id}", response_model=QuestionResponse)
+def get_question_detail(
+    question_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    question = db.query(Question).join(Course).filter(Question.id == question_id, Course.user_id == current_user.id).first()
+    if not question:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Câu hỏi không tồn tại hoặc bạn không có quyền truy cập."
+        )
+    return question
+
+
 # --- API AI MCQ GENERATION WITH SELF-CORRECTION ---
 
 @router.post("/{course_id}/questions/generate")
@@ -100,6 +188,22 @@ def generate_questions(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Môn học không tồn tại hoặc bạn không có quyền truy cập."
+        )
+        
+    # --- Langfuse: Khởi tạo Parent Trace cho toàn bộ luồng sinh MCQ ---
+    trace = None
+    if langfuse:
+        trace = langfuse.trace(
+            name="mcq_generation_flow",
+            metadata={
+                "course_id": course_id,
+                "course_name": course.course_name,
+                "bloom_level": req.bloom_level,
+                "count": req.count,
+                "clo_id": req.clo_id,
+                "chapter_id": req.chapter_id,
+                "user_id": current_user.id
+            }
         )
         
     # 2. Thu thập ngữ cảnh (CLO / Chapter / RAG)
@@ -126,35 +230,30 @@ def generate_questions(
             rag_context += f"[Tài liệu: {hit['file_name']}]: {hit['text']}\n\n"
 
     # 4. Thiết lập System Prompts cho Generator & Solver (Self-Correction)
-    generator_system_prompt = f"""Bạn là chuyên gia thiết kế câu hỏi trắc nghiệm kiểm tra đánh giá (Assessment Specialist).
-Nhiệm vụ: Hãy sinh {req.count} câu hỏi trắc nghiệm (MCQ) có chất lượng học thuật cao.
-Yêu cầu:
-- Mức độ Bloom nhận thức: Mức {req.bloom_level}.
-- Câu hỏi phải bám sát theo chuẩn đầu ra CLO và ngữ cảnh tài liệu RAG đã cho.
-- Mỗi câu hỏi gồm câu hỏi (question_text), danh sách 4 lựa chọn (options_json: mảng JSON gồm 4 chuỗi), đáp án đúng (correct_answer: phải trùng khớp với chính xác một trong 4 lựa chọn), và đường dẫn tư duy giải thích (reasoning_path: giải thích chi tiết tại sao chọn đáp án này).
+    generator_system_prompt = build_generator_system_prompt(count=req.count, bloom_level=req.bloom_level)
 
-Đầu ra định dạng JSON:
-{{
-  "questions": [
-    {{
-      "question_text": "Nội dung câu hỏi...",
-      "question_type": "MCQ",
-      "options_json": "[\"Lựa chọn A\", \"Lựa chọn B\", \"Lựa chọn C\", \"Lựa chọn D\"]",
-      "correct_answer": "Lựa chọn A",
-      "bloom_level": {req.bloom_level},
-      "reasoning_path": "Giải thích chi tiết các bước logic..."
-    }}
-  ]
-}}
-"""
-
-    prompt = f"Thông tin môn học: {course.course_name}\n{clo_context}{chapter_context}\nNgữ cảnh tài liệu nguồn RAG:\n{rag_context}\n\nHãy sinh danh sách câu hỏi."
+    prompt = build_generator_user_prompt(
+        course_name=course.course_name,
+        clo_context=clo_context,
+        chapter_context=chapter_context,
+        rag_context=rag_context,
+    )
 
     # 5. Pha 1: Generator sinh câu hỏi nháp
+    generator_span = trace.span(name="generator_phase") if trace else None
     try:
-        gen_data = call_llm_json(prompt, system_instruction=generator_system_prompt)
+        gen_data = call_llm_json(
+            prompt, system_instruction=generator_system_prompt, temperature=0.7,
+            trace_or_span=generator_span,
+            prompt_name="mcq_generator", prompt_version="v1",
+            metadata={"phase": "generator", "count": req.count, "bloom": req.bloom_level}
+        )
         raw_questions = gen_data.get("questions", [])
+        if generator_span:
+            generator_span.end(output={"raw_count": len(raw_questions)})
     except Exception as e:
+        if generator_span:
+            generator_span.end(output={"error": str(e)})
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Lỗi khi sinh câu hỏi nháp: {str(e)}"
@@ -163,61 +262,86 @@ Yêu cầu:
     # 6. Pha 2: Solver/Verifier duyệt tự sửa lỗi (Self-Correction)
     validated_questions = []
     
-    solver_system_prompt = """Bạn là một học sinh thông minh đang làm bài thi trắc nghiệm. Bạn tuyệt đối không biết đáp án trước.
-Nhiệm vụ: Hãy giải câu hỏi trắc nghiệm sau đây một cách độc lập và khách quan nhất.
-Quy tắc:
-- Phân tích chi tiết từng lựa chọn dựa trên kiến thức logic và thông tin đề bài cung cấp.
-- Đưa ra phân tích lập luận từng bước (reasoning_path).
-- Cuối cùng, chọn ra đáp án đúng duy nhất (phải là một trong các lựa chọn được cho sẵn).
+    if req.fast_mode:
+        validated_questions = raw_questions
+    else:
+        solver_system_prompt = SOLVER_SYSTEM_PROMPT
 
-Đầu ra bắt buộc là định dạng JSON:
-{
-  "reasoning_path": "Phân tích logic từng bước...",
-  "selected_answer": "Đáp án bạn chọn"
-}
-"""
-
-    for q in raw_questions:
-        correct = False
-        attempts = 0
-        current_question = q
-        
-        while not correct and attempts < 3:
-            attempts += 1
-            # Đóng vai Solver giải thử
-            solver_prompt = f"""Câu hỏi: {current_question.get('question_text')}
-Các lựa chọn: {current_question.get('options_json')}
-
-Hãy phân tích giải và đưa ra đáp án."""
+        for idx, q in enumerate(raw_questions):
+            correct = False
+            attempts = 0
+            current_question = q
+            guardrail_passed_first = False
             
-            try:
-                solver_res = call_llm_json(solver_prompt, system_instruction=solver_system_prompt)
-                selected_ans = solver_res.get("selected_answer", "").strip()
-                target_ans = current_question.get("correct_answer", "").strip()
+            # --- Langfuse: Span con cho mỗi câu hỏi qua Guardrail ---
+            val_span = trace.span(name=f"validation_phase_q{idx+1}", metadata={"question_index": idx+1}) if trace else None
+            
+            while not correct and attempts < 3:
+                attempts += 1
+                # Đóng vai Solver giải thử
+                solver_prompt = build_solver_prompt(
+                    question_text=current_question.get('question_text'),
+                    options_json=current_question.get('options_json'),
+                )
                 
-                # So sánh đáp án Generator và Solver
-                if selected_ans.lower() == target_ans.lower() or selected_ans in target_ans or target_ans in selected_ans:
-                    correct = True
-                    # Cập nhật reasoning_path kết hợp cả hai
-                    current_question["reasoning_path"] = f"Generator reasoning: {current_question.get('reasoning_path')} | Solver reasoning: {solver_res.get('reasoning_path')}"
-                else:
-                    # Nếu đáp án mâu thuẫn -> Bắt LLM sửa câu hỏi (Self-Correction Step)
-                    correction_prompt = f"""Câu hỏi bạn vừa sinh có mâu thuẫn logic:
-- Đề bài: {current_question.get('question_text')}
-- Các lựa chọn: {current_question.get('options_json')}
-- Đáp án Generator chỉ định: {target_ans}
-- Học sinh độc lập giải ra: {selected_ans} (Tư duy giải: {solver_res.get('reasoning_path')})
-
-Hãy sửa lại câu hỏi hoặc các phương án lựa chọn và chỉ định đáp án đúng chính xác nhất để không còn bất kỳ mâu thuẫn nào.
-Đầu ra định dạng JSON giống như cấu trúc Generator ban đầu."""
+                try:
+                    solver_res = call_llm_json(
+                        solver_prompt, system_instruction=solver_system_prompt, temperature=0.0,
+                        trace_or_span=val_span,
+                        prompt_name="mcq_solver_guardrail", prompt_version="v1",
+                        metadata={"phase": "solver", "attempt": attempts, "question_index": idx+1}
+                    )
+                    selected_ans_val = solver_res.get("selected_answer", "")
+                    selected_ans = str(selected_ans_val).strip() if selected_ans_val is not None else ""
                     
-                    current_question = call_llm_json(correction_prompt, system_instruction=generator_system_prompt)
-            except Exception as e:
-                # Nếu Solver lỗi, fallback chấp nhận câu hỏi gốc
-                print(f"Lỗi trong quá trình Solver giải thử: {e}")
-                correct = True
-                
-        validated_questions.append(current_question)
+                    target_ans_val = current_question.get("correct_answer", "")
+                    target_ans = str(target_ans_val).strip() if target_ans_val is not None else ""
+                    
+                    # So sánh đáp án Generator và Solver
+                    if selected_ans.lower() == target_ans.lower() or selected_ans in target_ans or target_ans in selected_ans:
+                        correct = True
+                        if attempts == 1:
+                            guardrail_passed_first = True
+                        # Cập nhật reasoning_path kết hợp cả hai
+                        current_question["reasoning_path"] = f"Generator reasoning: {current_question.get('reasoning_path')} | Solver reasoning: {solver_res.get('reasoning_path')}"
+                    else:
+                        # Nếu đáp án mâu thuẫn -> Bắt LLM sửa câu hỏi (Self-Correction Step)
+                        correction_prompt = build_correction_prompt(
+                            question_text=current_question.get('question_text'),
+                            options_json=current_question.get('options_json'),
+                            target_answer=target_ans,
+                            solver_answer=selected_ans,
+                            solver_reasoning=solver_res.get('reasoning_path', ''),
+                        )
+                        
+                        corrected_data = call_llm_json(
+                            correction_prompt, system_instruction=generator_system_prompt, temperature=0.7,
+                            trace_or_span=val_span,
+                            prompt_name="mcq_self_correction", prompt_version="v1",
+                            metadata={"phase": "correction", "attempt": attempts, "question_index": idx+1}
+                        )
+                        if "questions" in corrected_data and corrected_data["questions"]:
+                            current_question = corrected_data["questions"][0]
+                        else:
+                            current_question = corrected_data
+                except Exception as e:
+                    # Nếu Solver lỗi, fallback chấp nhận câu hỏi gốc
+                    print(f"[ERROR] Solver validation exception: {str(e)}")
+                    correct = True
+                    
+            # --- Langfuse: Gửi Eval Scores cho câu hỏi này ---
+            if trace:
+                try:
+                    trace.score(name="mcq_guardrail_pass", value=1.0 if guardrail_passed_first else 0.0,
+                                comment=f"Q{idx+1}: {'Pass on 1st attempt' if guardrail_passed_first else f'Required {attempts} attempts'}")
+                    trace.score(name="self_correction_attempts", value=float(attempts),
+                                comment=f"Q{idx+1}: {attempts} solver attempt(s)")
+                except Exception:
+                    pass
+            if val_span:
+                val_span.end(output={"final_answer": current_question.get('correct_answer'), "attempts": attempts, "passed_first": guardrail_passed_first})
+                    
+            validated_questions.append(current_question)
 
     # 7. Lưu các câu hỏi hợp lệ vào Database
     saved_questions = []
@@ -245,6 +369,14 @@ Hãy sửa lại câu hỏi hoặc các phương án lựa chọn và chỉ đ�
     db.commit()
     for q in saved_questions:
         db.refresh(q)
+    
+    # --- Langfuse: Đóng Parent Trace ---
+    if trace:
+        try:
+            trace.update(output={"saved_count": len(saved_questions)})
+            langfuse.flush()
+        except Exception:
+            pass
         
     return {
         "message": f"Sinh thành công {len(saved_questions)} câu hỏi trắc nghiệm đã qua Self-Correction.",
@@ -260,6 +392,242 @@ Hãy sửa lại câu hỏi hoặc các phương án lựa chọn và chỉ đ�
             for q in saved_questions
         ]
     }
+
+
+# --- STREAMING SSE ENDPOINT: Real-time progress per question ---
+
+@router.post("/{course_id}/questions/generate-stream")
+def generate_questions_stream(
+    course_id: int,
+    req: QuestionGenerateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Sinh câu hỏi trắc nghiệm và stream tiến độ real-time qua SSE (Server-Sent Events).
+    Frontend lắng nghe các event: stage | question | done | error
+    """
+    # 1. Xác thực quyền
+    course = db.query(Course).filter(Course.id == course_id, Course.user_id == current_user.id).first()
+    if not course:
+        raise HTTPException(status_code=404, detail="Môn học không tồn tại.")
+
+    # 2. Thu thập ngữ cảnh
+    target_clo = db.query(CLO).filter(CLO.id == req.clo_id, CLO.course_id == course_id).first() if req.clo_id else None
+    target_chapter = db.query(Chapter).filter(Chapter.id == req.chapter_id, Chapter.course_id == course_id).first() if req.chapter_id else None
+    clo_context = f"[{target_clo.clo_code}] {target_clo.description} (Bloom: {target_clo.bloom_level})" if target_clo else ""
+    chapter_context = f"{target_chapter.title} - {target_chapter.description or ''}" if target_chapter else ""
+
+    # Snapshot tham số cần dùng trong generator (tránh giữ session qua thread)
+    course_name = course.course_name
+    bloom_level = req.bloom_level
+    count = req.count
+    clo_id = req.clo_id
+    chapter_id = req.chapter_id
+    user_id = current_user.id
+
+    # --- Langfuse: Parent Trace cho SSE stream ---
+    stream_trace = None
+    if langfuse:
+        stream_trace = langfuse.trace(
+            name="mcq_generation_stream",
+            metadata={
+                "course_id": course_id, "course_name": course_name,
+                "bloom_level": bloom_level, "count": count,
+                "clo_id": clo_id, "chapter_id": chapter_id, "user_id": user_id
+            }
+        )
+
+    def event_stream():
+        def send(event: str, data: dict):
+            return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+        yield send("stage", {"stage": 1, "message": "✅ Đang truy xuất Vector DB (RAG) và các chuẩn đầu ra CLO..."})
+
+        # RAG search
+        query_str = f"{clo_context} {chapter_context}"
+        rag_hits = search_rag_isolated(query_str, user_id=user_id, course_id=course_id, top_k=4)
+        rag_context = ""
+        if rag_hits:
+            for hit in rag_hits:
+                rag_context += f"[Tài liệu: {hit['file_name']}]: {hit['text']}\n\n"
+
+        yield send("stage", {"stage": 2, "message": f"✅ RAG tìm thấy {len(rag_hits)} đoạn trích. Đang gọi mô hình AI (Qwen/Gemini)..."})
+
+        generator_system_prompt = build_generator_system_prompt_compact(count=count, bloom_level=bloom_level)
+
+        prompt = build_generator_user_prompt_compact(
+            course_name=course_name,
+            clo_context=clo_context,
+            chapter_context=chapter_context,
+            rag_context=rag_context,
+            count=count,
+        )
+
+        gen_span = stream_trace.span(name="generator_phase_stream") if stream_trace else None
+        try:
+            gen_data = call_llm_json(
+                prompt, system_instruction=generator_system_prompt, temperature=0.7,
+                trace_or_span=gen_span,
+                prompt_name="mcq_generator_stream", prompt_version="v1",
+                metadata={"phase": "generator", "count": count, "bloom": bloom_level}
+            )
+            raw_questions = gen_data.get("questions", [])
+            if gen_span:
+                gen_span.end(output={"raw_count": len(raw_questions)})
+        except Exception as e:
+            if gen_span:
+                gen_span.end(output={"error": str(e)})
+            yield send("error", {"message": f"Sinh câu hỏi thất bại: {str(e)}"})
+            return
+
+        # Mở session mới để save (tránh commit trên session đã detach)
+        new_db = SessionLocal()
+        saved_questions = []
+
+        try:
+            if req.fast_mode:
+                yield send("stage", {"stage": 3, "message": f"⚡ Chế độ sinh nhanh: Bỏ qua bước Self-Correction. Đang lưu {len(raw_questions)} câu hỏi vào CSDL..."})
+                for idx, q in enumerate(raw_questions):
+                    opts = q.get("options_json", "[]")
+                    opts_str = json.dumps(opts) if isinstance(opts, list) else opts
+                    new_q_obj = Question(
+                        course_id=course_id,
+                        chapter_id=chapter_id,
+                        question_text=q.get("question_text", ""),
+                        question_type="MCQ",
+                        options_json=opts_str,
+                        correct_answer=q.get("correct_answer", ""),
+                        bloom_level=q.get("bloom_level", bloom_level),
+                        clo_id=clo_id
+                    )
+                    new_db.add(new_q_obj)
+                    new_db.commit()
+                    new_db.refresh(new_q_obj)
+                    saved_questions.append(new_q_obj)
+                    
+                    yield send("question", {
+                        "index": idx + 1,
+                        "total": len(raw_questions),
+                        "question": {
+                            "id": new_q_obj.id,
+                            "question_text": new_q_obj.question_text,
+                            "options_json": new_q_obj.options_json,
+                            "correct_answer": new_q_obj.correct_answer,
+                            "bloom_level": new_q_obj.bloom_level,
+                            "clo_id": new_q_obj.clo_id
+                        }
+                    })
+            else:
+                yield send("stage", {"stage": 3, "message": f"✅ Generator sinh xong {len(raw_questions)} câu. Bắt đầu Self-Correction..."})
+                solver_system_prompt = SOLVER_SYSTEM_PROMPT_COMPACT
+
+                for idx, q in enumerate(raw_questions):
+                    yield send("stage", {"stage": 3, "message": f"⏳ Đang xác minh câu {idx+1}/{len(raw_questions)} (Self-Correction)..."})
+
+                    correct = False
+                    attempts = 0
+                    current_q = q
+                    guardrail_ok = False
+                    
+                    val_span = stream_trace.span(name=f"validation_stream_q{idx+1}", metadata={"question_index": idx+1}) if stream_trace else None
+
+                    while not correct and attempts < 2:
+                        attempts += 1
+                        try:
+                            solver_prompt = f"Câu hỏi: {current_q.get('question_text')}\nLựa chọn: {current_q.get('options_json')}\nPhân tích và chọn đáp án."
+                            solver_res = call_llm_json(
+                                solver_prompt, system_instruction=solver_system_prompt, temperature=0.0,
+                                trace_or_span=val_span,
+                                prompt_name="mcq_solver_guardrail_stream", prompt_version="v1",
+                                metadata={"phase": "solver", "attempt": attempts, "question_index": idx+1}
+                            )
+                            selected = solver_res.get("selected_answer", "").strip()
+                            target = current_q.get("correct_answer", "").strip()
+                            if selected.lower() == target.lower() or selected in target or target in selected:
+                                correct = True
+                                if attempts == 1:
+                                    guardrail_ok = True
+                            else:
+                                correction_prompt = f"""Câu hỏi mâu thuẫn logic:\nĐề: {current_q.get('question_text')}\nLựa chọn: {current_q.get('options_json')}\nGenerator chỉ định: {target}\nSolver giải ra: {selected}\nSửa lại câu hỏi hoặc đáp án. JSON giống cấu trúc gốc."""
+                                corrected_data = call_llm_json(
+                                    correction_prompt, system_instruction=generator_system_prompt, temperature=0.7,
+                                    trace_or_span=val_span,
+                                    prompt_name="mcq_self_correction_stream", prompt_version="v1",
+                                    metadata={"phase": "correction", "attempt": attempts, "question_index": idx+1}
+                                )
+                                if "questions" in corrected_data and corrected_data["questions"]:
+                                    current_q = corrected_data["questions"][0]
+                                else:
+                                    current_q = corrected_data
+                        except Exception:
+                            correct = True
+
+                    if stream_trace:
+                        try:
+                            stream_trace.score(name="mcq_guardrail_pass", value=1.0 if guardrail_ok else 0.0,
+                                               comment=f"Q{idx+1}: {'Pass 1st' if guardrail_ok else f'{attempts} attempts'}")
+                            stream_trace.score(name="self_correction_attempts", value=float(attempts),
+                                               comment=f"Q{idx+1}: {attempts} attempt(s)")
+                        except Exception:
+                            pass
+                    if val_span:
+                        val_span.end(output={"final_answer": current_q.get('correct_answer'), "attempts": attempts})
+
+                    # Save to DB
+                    opts = current_q.get("options_json", "[]")
+                    opts_str = json.dumps(opts) if isinstance(opts, list) else opts
+                    new_q_obj = Question(
+                        course_id=course_id,
+                        chapter_id=chapter_id,
+                        question_text=current_q.get("question_text", ""),
+                        question_type="MCQ",
+                        options_json=opts_str,
+                        correct_answer=current_q.get("correct_answer", ""),
+                        bloom_level=current_q.get("bloom_level", bloom_level),
+                        clo_id=clo_id
+                    )
+                    new_db.add(new_q_obj)
+                    new_db.commit()
+                    new_db.refresh(new_q_obj)
+                    saved_questions.append(new_q_obj)
+
+                    yield send("question", {
+                        "index": idx + 1,
+                        "total": len(raw_questions),
+                        "question": {
+                            "id": new_q_obj.id,
+                            "question_text": new_q_obj.question_text,
+                            "options_json": new_q_obj.options_json,
+                            "correct_answer": new_q_obj.correct_answer,
+                            "bloom_level": new_q_obj.bloom_level,
+                            "clo_id": new_q_obj.clo_id
+                        }
+                    })
+
+        finally:
+            new_db.close()
+
+        yield send("done", {
+            "message": f"✅ Hoàn tất! Đã sinh và xác minh {len(saved_questions)}/{count} câu hỏi.",
+            "total": len(saved_questions)
+        })
+        
+        if stream_trace:
+            try:
+                stream_trace.update(output={"saved_count": len(saved_questions)})
+                langfuse.flush()
+            except Exception:
+                pass
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no"
+        }
+    )
 
 # --- API AI ISOMORPHIC GENERATION (SINH CÂU HỎI TƯƠNG TỰ) ---
 
@@ -297,8 +665,21 @@ Các lựa chọn gốc: {orig_q.options_json}
 
 Hãy tạo câu hỏi đồng cấu."""
 
+    # --- Langfuse: Trace cho isomorphic generation ---
+    iso_trace = None
+    if langfuse:
+        iso_trace = langfuse.trace(
+            name="isomorphic_question_generation",
+            metadata={"original_question_id": question_id, "bloom_level": orig_q.bloom_level}
+        )
+
     try:
-        iso_json = call_llm_json(prompt, system_instruction=system_prompt)
+        iso_json = call_llm_json(
+            prompt, system_instruction=system_prompt,
+            trace_or_span=iso_trace,
+            prompt_name="mcq_isomorphic", prompt_version="v1",
+            metadata={"original_question_id": question_id}
+        )
         
         opts = iso_json.get("options_json", "[]")
         if isinstance(opts, list):
@@ -356,28 +737,56 @@ def get_matrix_coverage(
         
     # 2. Lấy danh sách CLO của môn học
     clos = db.query(CLO).filter(CLO.course_id == course_id).all()
+    clo_map = {c.id: c for c in clos}
     
     # 3. Lấy tất cả câu hỏi của môn học
     questions = db.query(Question).filter(Question.course_id == course_id).all()
     
-    # 4. Thống kê số lượng câu hỏi phủ theo ma trận CLO x Bloom Level (1->6)
+    # 4. Thống kê số lượng câu hỏi và học liệu phủ theo ma trận CLO x Bloom Level (1->6)
+    import re
     matrix = {}
     for c in clos:
         matrix[c.clo_code] = {
             "clo_id": c.id,
             "description": c.description,
             "target_bloom": c.bloom_level,
-            "levels": {str(b): 0 for b in range(1, 7)}
+            "levels": {str(b): 0 for b in range(1, 7)}, # Backward compatibility for question levels
+            "question_levels": {str(b): 0 for b in range(1, 7)},
+            "material_levels": {str(b): 0 for b in range(1, 7)}
         }
         
     for q in questions:
         if q.clo_id:
-            # Tìm clo_code tương ứng
-            clo = db.query(CLO).filter(CLO.id == q.clo_id).first()
+            # Tìm clo_code tương ứng từ map thay vì query DB
+            clo = clo_map.get(q.clo_id)
             if clo and clo.clo_code in matrix:
                 bloom_str = str(q.bloom_level)
-                if bloom_str in matrix[clo.clo_code]["levels"]:
+                if bloom_str in matrix[clo.clo_code]["question_levels"]:
+                    matrix[clo.clo_code]["question_levels"][bloom_str] += 1
                     matrix[clo.clo_code]["levels"][bloom_str] += 1
+
+    # Duyệt qua các học liệu slide để phân tích độ phủ CLO/Bloom
+    materials = db.query(ChapterMaterial).join(Chapter).filter(Chapter.course_id == course_id).all()
+    for m in materials:
+        if not m.slide_content:
+            continue
+        # Tách các slide theo dấu tiêu đề '#'
+        slides = re.split(r'\n#\s+', '\n' + m.slide_content)
+        for slide in slides:
+            if not slide.strip():
+                continue
+            clo_matches = re.findall(r'\[CLO\s*:\s*([^\]]+)\]', slide, re.IGNORECASE)
+            bloom_matches = re.findall(r'\[Bloom\s*:\s*B?([1-6])\]', slide, re.IGNORECASE)
+            
+            bloom_lvl = int(bloom_matches[0]) if bloom_matches else None
+            
+            for clo_code in clo_matches:
+                clo_code = clo_code.strip()
+                if clo_code in matrix:
+                    target_bloom = matrix[clo_code]["target_bloom"]
+                    b_lvl = str(bloom_lvl) if bloom_lvl else str(target_bloom)
+                    if b_lvl in matrix[clo_code]["material_levels"]:
+                        matrix[clo_code]["material_levels"][b_lvl] += 1
 
     return {
         "course_id": course_id,

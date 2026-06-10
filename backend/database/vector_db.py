@@ -1,6 +1,9 @@
+import os
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
 import chromadb
 from chromadb.utils import embedding_functions
-import os
 import re
 
 # Khởi tạo ChromaDB persistent storage trong thư mục backend/data/chroma_db
@@ -9,21 +12,55 @@ os.makedirs(DB_DIR, exist_ok=True)
 
 chroma_client = chromadb.PersistentClient(path=DB_DIR)
 
-# Thiết lập hàm Embeddings
-try:
-    # Sử dụng SentenceTransformer cục bộ (384 dimensions, rất nhanh và nhẹ)
-    embedding_func = embedding_functions.SentenceTransformerEmbeddingFunction(
-        model_name="all-MiniLM-L6-v2"
-    )
-    print("[SUCCESS] Da load SentenceTransformer embedding function thanh cong.")
-except Exception as e:
-    # Fallback sang Mock Embedding nếu thiếu torch/Transformers hoặc chạy offline lần đầu
-    print(f"[WARNING] Khong the load SentenceTransformer ({e}). Su dung Mock Embedding Function cho MVP.")
-    class MockEmbeddingFunction(chromadb.EmbeddingFunction):
-        def __call__(self, input: chromadb.Documents) -> chromadb.Embeddings:
-            # Sinh mảng float giả lập kích thước 384
-            return [[0.1] * 384 for _ in input]
-    embedding_func = MockEmbeddingFunction()
+class LazySentenceTransformerEmbeddingFunction(chromadb.EmbeddingFunction):
+    def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
+        self.model_name = model_name
+        self._func = None
+
+    @staticmethod
+    def name() -> str:
+        return "sentence_transformer"
+
+    def get_config(self) -> dict:
+        return {
+            "model_name": self.model_name,
+            "device": "cpu",
+            "normalize_embeddings": False,
+            "kwargs": {},
+        }
+
+    @staticmethod
+    def build_from_config(config: dict) -> "LazySentenceTransformerEmbeddingFunction":
+        return LazySentenceTransformerEmbeddingFunction(
+            model_name=config.get("model_name", "all-MiniLM-L6-v2")
+        )
+
+    def __call__(self, input: chromadb.Documents) -> chromadb.Embeddings:
+        if self._func is None:
+            if os.environ.get("TESTING") == "1":
+                print("[INFO] Testing mode detected: Using Mock Embedding Function.")
+                class MockEmbeddingFunction(chromadb.EmbeddingFunction):
+                    def __call__(self, input: chromadb.Documents) -> chromadb.Embeddings:
+                        return [[0.1] * 384 for _ in input]
+                self._func = MockEmbeddingFunction()
+            else:
+                try:
+                    # Sử dụng SentenceTransformer cục bộ (384 dimensions, rất nhanh và nhẹ)
+                    self._func = embedding_functions.SentenceTransformerEmbeddingFunction(
+                        model_name=self.model_name
+                    )
+                    print("[SUCCESS] Da load SentenceTransformer embedding function thanh cong.")
+                except Exception as e:
+                    # Fallback sang Mock Embedding nếu thiếu torch/Transformers hoặc chạy offline lần đầu
+                    print(f"[WARNING] Khong the load SentenceTransformer ({e}). Su dung Mock Embedding Function cho MVP.")
+                    class MockEmbeddingFunction(chromadb.EmbeddingFunction):
+                        def __call__(self, input: chromadb.Documents) -> chromadb.Embeddings:
+                            # Sinh mảng float giả lập kích thước 384
+                            return [[0.1] * 384 for _ in input]
+                    self._func = MockEmbeddingFunction()
+        return self._func(input)
+
+embedding_func = LazySentenceTransformerEmbeddingFunction()
 
 collection = chroma_client.get_or_create_collection(
     name="lecture_materials",

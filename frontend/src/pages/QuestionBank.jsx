@@ -1,7 +1,11 @@
 import React, { useState, useEffect } from 'react';
 import client from '../api/client';
+import FlowSteps from '../components/FlowSteps';
+import QuestionConfigForm from '../components/QuestionConfigForm';
+import QuestionEditorForm from '../components/QuestionEditorForm';
+import QuestionCard from '../components/QuestionCard';
 
-export default function QuestionBank({ course, onBack, onViewDashboard }) {
+export default function QuestionBank({ course, initialChapterId, initialCloId, initialBloomLevel, onBack, onGoToLessonPlanner, onViewDashboard, onNavigate }) {
   const [questions, setQuestions] = useState([]);
   const [clos, setClos] = useState([]);
   const [chapters, setChapters] = useState([]);
@@ -13,11 +17,13 @@ export default function QuestionBank({ course, onBack, onViewDashboard }) {
   const [count, setCount] = useState(3);
   const [generating, setGenerating] = useState(false);
   const [genLog, setGenLog] = useState('');
+  const [isFastMode, setIsFastMode] = useState(false);
 
   // States cho Form Web Search Ingestion
   const [searchQuery, setSearchQuery] = useState('');
   const [searching, setSearching] = useState(false);
   const [searchResult, setSearchResult] = useState(null);
+  const [expandedSearch, setExpandedSearch] = useState({});
 
   // General States
   const [loading, setLoading] = useState(false);
@@ -36,7 +42,9 @@ export default function QuestionBank({ course, onBack, onViewDashboard }) {
       // 2. Load CLOs
       const cloRes = await client.get(`/api/courses/${course.id}/clos`);
       setClos(cloRes.data);
-      if (cloRes.data.length > 0) {
+      if (initialCloId) {
+        setSelectedClo(initialCloId);
+      } else if (cloRes.data.length > 0) {
         setSelectedClo(cloRes.data[0].id);
       }
       
@@ -44,7 +52,8 @@ export default function QuestionBank({ course, onBack, onViewDashboard }) {
       const capRes = await client.get(`/api/courses/${course.id}/chapters`);
       setChapters(capRes.data);
       if (capRes.data.length > 0) {
-        setSelectedChapter(capRes.data[0].id);
+        const found = initialChapterId && capRes.data.some(c => c.id === initialChapterId);
+        setSelectedChapter(found ? initialChapterId : capRes.data[0].id);
       }
     } catch (err) {
       console.error(err);
@@ -58,39 +67,109 @@ export default function QuestionBank({ course, onBack, onViewDashboard }) {
     fetchData();
   }, [course.id]);
 
-  // Gọi sinh câu hỏi trắc nghiệm MCQ
+  // Đồng bộ hóa chương học được chọn khi prop initialChapterId thay đổi từ Roadmap
+  useEffect(() => {
+    if (initialChapterId && chapters.length > 0) {
+      const found = chapters.some(c => c.id === initialChapterId);
+      if (found && selectedChapter !== initialChapterId) {
+        setSelectedChapter(initialChapterId);
+      }
+    }
+  }, [initialChapterId, chapters, selectedChapter]);
+
+  // Đồng bộ hóa chuẩn đầu ra và mức Bloom khi được chuyển vùng từ Ma trận
+  useEffect(() => {
+    if (initialCloId) {
+      setSelectedClo(initialCloId);
+    }
+  }, [initialCloId]);
+
+  useEffect(() => {
+    if (initialBloomLevel) {
+      setBloomLevel(initialBloomLevel);
+    }
+  }, [initialBloomLevel]);
   const handleGenerateQuestions = async (e) => {
     e.preventDefault();
     setError('');
     setMessage('');
     setGenerating(true);
-    setGenLog('Bắt đầu khởi động AI Generator (Pha 1)...');
+    setGenLog('🚀 Khởi động AI Generator... đang kết nối OpenRouter...');
+
+    const token = localStorage.getItem('token');
 
     try {
-      setTimeout(() => setGenLog('AI Generator đã sinh câu hỏi nháp. Bắt đầu chuyển sang AI Solver để kiểm tra (Pha 2 - Self-Correction)...'), 1500);
-      setTimeout(() => setGenLog('Đang so sánh chéo đáp án... Phát hiện sự nhất quán hoặc đã sửa đổi tự động hoàn tất. Đang lưu vào hệ thống...'), 3200);
-      
-      const response = await client.post(`/api/courses/${course.id}/questions/generate`, {
-        clo_id: selectedClo ? parseInt(selectedClo) : null,
-        chapter_id: selectedChapter ? parseInt(selectedChapter) : null,
-        bloom_level: parseInt(bloomLevel),
-        count: parseInt(count)
-      });
-      
-      setTimeout(() => {
-        setQuestions([...questions, ...response.data.questions]);
-        setMessage(`Đã sinh thành công ${response.data.questions.length} câu hỏi MCQ đã được xác thực (Self-Corrected)!`);
-        setGenerating(false);
-        setGenLog('');
-      }, 4000);
+      const response = await fetch(
+        `http://localhost:8000/api/courses/${course.id}/questions/generate-stream`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${token}`
+          },
+          body: JSON.stringify({
+            clo_id: selectedClo ? parseInt(selectedClo) : null,
+            chapter_id: selectedChapter ? parseInt(selectedChapter) : null,
+            bloom_level: parseInt(bloomLevel),
+            count: parseInt(count),
+            fast_mode: isFastMode
+          })
+        }
+      );
+
+      if (!response.ok) {
+        throw new Error(`Lỗi server: ${response.status}`);
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      const newQuestions = [];
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop(); // Giữ lại dòng chưa hoàn chỉnh
+
+        let currentEvent = '';
+        for (const line of lines) {
+          if (line.startsWith('event: ')) {
+            currentEvent = line.slice(7).trim();
+          } else if (line.startsWith('data: ')) {
+            try {
+              const data = JSON.parse(line.slice(6));
+              
+              if (currentEvent === 'stage') {
+                setGenLog(data.message);
+              } else if (currentEvent === 'question') {
+                newQuestions.push(data.question);
+                setQuestions(prev => [...prev, data.question]);
+                setGenLog(`✅ Câu ${data.index}/${data.total} đã xác minh và lưu vào CSDL!`);
+              } else if (currentEvent === 'done') {
+                setMessage(data.message);
+                setGenerating(false);
+                setGenLog('');
+              } else if (currentEvent === 'error') {
+                setError(data.message);
+                setGenerating(false);
+                setGenLog('');
+              }
+            } catch (_) {}
+          }
+        }
+      }
 
     } catch (err) {
       console.error(err);
-      setError('Lỗi khi sinh câu hỏi trắc nghiệm AI.');
+      setError(`Lỗi kết nối stream: ${err.message}`);
       setGenerating(false);
       setGenLog('');
     }
   };
+
 
   // Sinh câu hỏi isomorphic
   const handleGenerateIsomorphic = async (qId) => {
@@ -117,6 +196,7 @@ export default function QuestionBank({ course, onBack, onViewDashboard }) {
     setMessage('');
     setSearching(true);
     setSearchResult(null);
+    setExpandedSearch({});
 
     try {
       const response = await client.post(`/api/courses/${course.id}/web-search-ingest`, {
@@ -130,6 +210,13 @@ export default function QuestionBank({ course, onBack, onViewDashboard }) {
     } finally {
       setSearching(false);
     }
+  };
+
+  const toggleSearchDetail = (key) => {
+    setExpandedSearch(prev => ({
+      ...prev,
+      [key]: !prev[key]
+    }));
   };
 
   // Sửa câu hỏi
@@ -147,28 +234,59 @@ export default function QuestionBank({ course, onBack, onViewDashboard }) {
     });
   };
 
+  const handleCreateManualClick = () => {
+    setEditingQuestion({
+      id: 'new',
+      question_text: '',
+      options: ['', '', '', ''],
+      correct_answer: '',
+      bloom_level: 3,
+      clo_id: clos.length > 0 ? clos[0].id : null,
+      chapter_id: selectedChapter ? parseInt(selectedChapter) : null
+    });
+  };
+
   const handleUpdateQuestion = async (e) => {
     e.preventDefault();
     setError('');
     setMessage('');
     
+    // Đảm bảo đáp án đúng phải trùng khớp với một trong các lựa chọn
+    if (!editingQuestion.options.includes(editingQuestion.correct_answer)) {
+      setError('Đáp án đúng phải trùng với một trong bốn lựa chọn đã nhập.');
+      return;
+    }
+
     try {
-      const response = await client.put(`/api/courses/questions/${editingQuestion.id}`, {
-        question_text: editingQuestion.question_text,
-        options_json: JSON.stringify(editingQuestion.options),
-        correct_answer: editingQuestion.correct_answer,
-        bloom_level: parseInt(editingQuestion.bloom_level),
-        clo_id: editingQuestion.clo_id ? parseInt(editingQuestion.clo_id) : null
-      });
-      
-      setQuestions(questions.map(q => q.id === editingQuestion.id ? response.data : q));
-      setMessage('Cập nhật câu hỏi thành công!');
+      if (editingQuestion.id === 'new') {
+        const response = await client.post(`/api/courses/${course.id}/questions`, {
+          chapter_id: editingQuestion.chapter_id ? parseInt(editingQuestion.chapter_id) : null,
+          question_text: editingQuestion.question_text,
+          options_json: JSON.stringify(editingQuestion.options),
+          correct_answer: editingQuestion.correct_answer,
+          bloom_level: parseInt(editingQuestion.bloom_level),
+          clo_id: editingQuestion.clo_id ? parseInt(editingQuestion.clo_id) : null
+        });
+        setQuestions([...questions, response.data]);
+        setMessage('Tạo câu hỏi thủ công thành công!');
+      } else {
+        const response = await client.put(`/api/courses/questions/${editingQuestion.id}`, {
+          question_text: editingQuestion.question_text,
+          options_json: JSON.stringify(editingQuestion.options),
+          correct_answer: editingQuestion.correct_answer,
+          bloom_level: parseInt(editingQuestion.bloom_level),
+          clo_id: editingQuestion.clo_id ? parseInt(editingQuestion.clo_id) : null
+        });
+        setQuestions(questions.map(q => q.id === editingQuestion.id ? response.data : q));
+        setMessage('Cập nhật câu hỏi thành công!');
+      }
       setEditingQuestion(null);
     } catch (err) {
       console.error(err);
-      setError('Lỗi khi cập nhật câu hỏi.');
+      setError(err.response?.data?.detail || 'Lỗi khi lưu câu hỏi.');
     }
   };
+
 
   // Xóa câu hỏi
   const handleDeleteQuestion = async (qId) => {
@@ -241,12 +359,20 @@ export default function QuestionBank({ course, onBack, onViewDashboard }) {
       {/* HEADER */}
       <header style={styles.header}>
         <div style={styles.headerLeft}>
-          <button onClick={onBack} style={styles.backBtn}>← Về Soạn Slide</button>
+          <button onClick={onBack} style={styles.backBtn}>← Sơ đồ</button>
+          {onGoToLessonPlanner && (
+            <button onClick={onGoToLessonPlanner} style={{ ...styles.backBtn, background: 'rgba(99, 102, 241, 0.15)', borderColor: 'rgba(99, 102, 241, 0.3)', color: '#a5b4fc', marginLeft: '8px' }}>
+              📖 Soạn Slide & Giáo án
+            </button>
+          )}
           <div>
             <span style={styles.badge}>{course.course_code}</span>
             <h2 style={styles.courseTitle}>Ngân Hàng Đề Thi & Câu Hỏi</h2>
           </div>
         </div>
+
+        {onNavigate && <FlowSteps activeStep="questions" onNavigate={onNavigate} />}
+
         <div style={styles.headerRight}>
           <button onClick={onViewDashboard} style={styles.dashboardBtn}>
             📊 Xem Ma trận Bloom-CLO
@@ -260,276 +386,77 @@ export default function QuestionBank({ course, onBack, onViewDashboard }) {
       {error && <div style={styles.errorAlert}>{error}</div>}
       {message && <div style={styles.successAlert}>{message}</div>}
 
+      {initialCloId && initialBloomLevel && (
+        <div style={{
+          background: 'rgba(99, 102, 241, 0.15)',
+          border: '1px solid rgba(99, 102, 241, 0.4)',
+          color: '#a5b4fc',
+          padding: '12px 20px',
+          borderRadius: '10px',
+          fontSize: '13px',
+          marginBottom: '20px',
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          animation: 'fadeIn 0.3s ease-in-out'
+        }}>
+          <div>
+            🎯 <strong>Đang khắc phục điểm mù chất lượng:</strong> AI Generator và Bộ lọc đã được tự động điều chỉnh chọn chuẩn đầu ra và mức Bloom tương ứng. Nhấn <strong>"Sinh câu hỏi qua AI"</strong> ở bảng bên trái hoặc thêm thủ công để bù đắp.
+          </div>
+        </div>
+      )}
+
       <div style={styles.mainGrid}>
-        {/* SIDEBAR TRÁI: ĐIỀU KHIỂN AI & WEB SEARCH */}
-        <aside style={styles.sidebar}>
-          
-          {/* SECTION 1: AI GENERATOR */}
-          <section style={styles.card}>
-            <h3 style={styles.cardTitle}>Sinh Câu Hỏi MCQ (AI)</h3>
-            <form onSubmit={handleGenerateQuestions} style={styles.form}>
-              <div style={styles.formGroup}>
-                <label style={styles.label}>Chuẩn đầu ra (CLO)</label>
-                <select 
-                  value={selectedClo} 
-                  onChange={(e) => setSelectedClo(e.target.value)}
-                  style={styles.select}
-                  required
-                >
-                  {clos.map(c => (
-                    <option key={c.id} value={c.id}>[{c.clo_code}] {c.description.substring(0, 35)}...</option>
-                  ))}
-                </select>
-              </div>
-
-              <div style={styles.formGroup}>
-                <label style={styles.label}>Chương học liên quan</label>
-                <select 
-                  value={selectedChapter} 
-                  onChange={(e) => setSelectedChapter(e.target.value)}
-                  style={styles.select}
-                >
-                  <option value="">Không bắt buộc</option>
-                  {chapters.map(c => (
-                    <option key={c.id} value={c.id}>{c.title}</option>
-                  ))}
-                </select>
-              </div>
-
-              <div style={styles.formRow}>
-                <div style={styles.formGroup}>
-                  <label style={styles.label}>Mức Bloom</label>
-                  <select 
-                    value={bloomLevel} 
-                    onChange={(e) => setBloomLevel(e.target.value)}
-                    style={styles.select}
-                  >
-                    <option value={1}>Nhớ (B1)</option>
-                    <option value={2}>Hiểu (B2)</option>
-                    <option value={3}>Vận dụng (B3)</option>
-                    <option value={4}>Phân tích (B4)</option>
-                    <option value={5}>Đánh giá (B5)</option>
-                    <option value={6}>Sáng tạo (B6)</option>
-                  </select>
-                </div>
-                <div style={styles.formGroup}>
-                  <label style={styles.label}>Số lượng</label>
-                  <input 
-                    type="number" 
-                    min="1" 
-                    max="5"
-                    value={count}
-                    onChange={(e) => setCount(e.target.value)}
-                    style={styles.input}
-                  />
-                </div>
-              </div>
-
-              <button type="submit" disabled={generating || loading} style={styles.submitBtn}>
-                {generating ? 'AI Đang thực thi...' : 'Khởi chạy AI MCQ Generator'}
-              </button>
-
-              {generating && (
-                <div style={styles.genLogBox}>
-                  <div style={styles.pulseDot}></div>
-                  <span style={styles.logText}>{genLog}</span>
-                </div>
-              )}
-            </form>
-          </section>
-
-          {/* SECTION 2: WEB SEARCH AGENT INGESTION */}
-          <section style={styles.card}>
-            <h3 style={styles.cardTitle}>Tìm kiếm học thuật & Nạp RAG</h3>
-            <form onSubmit={handleWebSearch} style={styles.form}>
-              <div style={styles.formGroup}>
-                <label style={styles.label}>Từ khóa học thuật Internet</label>
-                <input
-                  type="text"
-                  placeholder="Ví dụ: AVL tree balance factor rotation..."
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
-                  style={styles.input}
-                  required
-                />
-              </div>
-              <button type="submit" disabled={searching || loading} style={styles.searchBtn}>
-                {searching ? 'Đang duyệt học thuật...' : 'Tìm kiếm & Đánh giá uy tín'}
-              </button>
-            </form>
-
-            {searchResult && (
-              <div style={styles.searchResults}>
-                <div style={styles.searchResultHeader}>
-                  Kết quả (Chấp nhận {searchResult.ingested.length} | Từ chối {searchResult.rejected.length})
-                </div>
-                
-                {/* INGESTED (XANH) */}
-                {searchResult.ingested.map((src, i) => (
-                  <div key={`ing-${i}`} style={styles.resultItemGreen}>
-                    <div style={styles.resultTitle}>
-                      <span style={styles.scoreBadgeGreen}>{(src.score * 100).toFixed(0)}%</span>
-                      <strong>{src.title}</strong>
-                    </div>
-                    <div style={styles.resultUrl}>{src.url}</div>
-                    <div style={styles.resultReason}>{src.justification}</div>
-                  </div>
-                ))}
-
-                {/* REJECTED (ĐỎ) */}
-                {searchResult.rejected.map((src, i) => (
-                  <div key={`rej-${i}`} style={styles.resultItemRed}>
-                    <div style={styles.resultTitle}>
-                      <span style={styles.scoreBadgeRed}>{(src.score * 100).toFixed(0)}%</span>
-                      <strong>{src.title}</strong>
-                    </div>
-                    <div style={styles.resultUrl}>{src.url}</div>
-                    <div style={styles.resultReason}>{src.justification}</div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </section>
-
-        </aside>
+        <QuestionConfigForm
+          selectedClo={selectedClo}
+          setSelectedClo={setSelectedClo}
+          clos={clos}
+          selectedChapter={selectedChapter}
+          setSelectedChapter={setSelectedChapter}
+          chapters={chapters}
+          bloomLevel={bloomLevel}
+          setBloomLevel={setBloomLevel}
+          count={count}
+          setCount={setCount}
+          generating={generating}
+          loading={loading}
+          genLog={genLog}
+          handleGenerateQuestions={handleGenerateQuestions}
+          isFastMode={isFastMode}
+          setIsFastMode={setIsFastMode}
+          styles={styles}
+        />
 
         {/* BẢNG CHÍNH BÊN PHẢI: CHI TIẾT CÂU HỎI */}
         <main style={styles.contentArea}>
-          
-          {editingQuestion ? (
-            /* KHUNG SỬA CÂU HỎI INLINE */
-            <section style={styles.editorCard}>
-              <h3 style={styles.editorTitle}>Chỉnh sửa Câu hỏi</h3>
-              <form onSubmit={handleUpdateQuestion} style={styles.form}>
-                <div style={styles.formGroup}>
-                  <label style={styles.label}>Nội dung câu hỏi</label>
-                  <textarea
-                    value={editingQuestion.question_text}
-                    onChange={(e) => setEditingQuestion({...editingQuestion, question_text: e.target.value})}
-                    style={styles.textarea}
-                    rows={3}
-                    required
-                  />
-                </div>
-
-                <div style={styles.formRow}>
-                  <div style={styles.formGroup}>
-                    <label style={styles.label}>Lựa chọn A</label>
-                    <input
-                      type="text"
-                      value={editingQuestion.options[0]}
-                      onChange={(e) => {
-                        const newOpts = [...editingQuestion.options];
-                        newOpts[0] = e.target.value;
-                        setEditingQuestion({...editingQuestion, options: newOpts});
-                      }}
-                      style={styles.input}
-                      required
-                    />
-                  </div>
-                  <div style={styles.formGroup}>
-                    <label style={styles.label}>Lựa chọn B</label>
-                    <input
-                      type="text"
-                      value={editingQuestion.options[1]}
-                      onChange={(e) => {
-                        const newOpts = [...editingQuestion.options];
-                        newOpts[1] = e.target.value;
-                        setEditingQuestion({...editingQuestion, options: newOpts});
-                      }}
-                      style={styles.input}
-                      required
-                    />
-                  </div>
-                </div>
-
-                <div style={styles.formRow}>
-                  <div style={styles.formGroup}>
-                    <label style={styles.label}>Lựa chọn C</label>
-                    <input
-                      type="text"
-                      value={editingQuestion.options[2]}
-                      onChange={(e) => {
-                        const newOpts = [...editingQuestion.options];
-                        newOpts[2] = e.target.value;
-                        setEditingQuestion({...editingQuestion, options: newOpts});
-                      }}
-                      style={styles.input}
-                      required
-                    />
-                  </div>
-                  <div style={styles.formGroup}>
-                    <label style={styles.label}>Lựa chọn D</label>
-                    <input
-                      type="text"
-                      value={editingQuestion.options[3]}
-                      onChange={(e) => {
-                        const newOpts = [...editingQuestion.options];
-                        newOpts[3] = e.target.value;
-                        setEditingQuestion({...editingQuestion, options: newOpts});
-                      }}
-                      style={styles.input}
-                      required
-                    />
-                  </div>
-                </div>
-
-                <div style={styles.formRow}>
-                  <div style={styles.formGroup}>
-                    <label style={styles.label}>Đáp án đúng (chọn trùng khớp)</label>
-                    <select
-                      value={editingQuestion.correct_answer}
-                      onChange={(e) => setEditingQuestion({...editingQuestion, correct_answer: e.target.value})}
-                      style={styles.select}
-                    >
-                      {editingQuestion.options.map((opt, i) => (
-                        <option key={i} value={opt}>{opt || `Lựa chọn ${String.fromCharCode(65 + i)}`}</option>
-                      ))}
-                    </select>
-                  </div>
-                  <div style={styles.formGroup}>
-                    <label style={styles.label}>Mức Bloom</label>
-                    <select
-                      value={editingQuestion.bloom_level}
-                      onChange={(e) => setEditingQuestion({...editingQuestion, bloom_level: parseInt(e.target.value)})}
-                      style={styles.select}
-                    >
-                      <option value={1}>Nhớ (B1)</option>
-                      <option value={2}>Hiểu (B2)</option>
-                      <option value={3}>Vận dụng (B3)</option>
-                      <option value={4}>Phân tích (B4)</option>
-                      <option value={5}>Đánh giá (B5)</option>
-                      <option value={6}>Sáng tạo (B6)</option>
-                    </select>
-                  </div>
-                </div>
-
-                <div style={styles.formGroup}>
-                  <label style={styles.label}>Chuẩn đầu ra (CLO)</label>
-                  <select
-                    value={editingQuestion.clo_id || ''}
-                    onChange={(e) => setEditingQuestion({...editingQuestion, clo_id: e.target.value ? parseInt(e.target.value) : null})}
-                    style={styles.select}
-                  >
-                    <option value="">Không liên kết</option>
-                    {clos.map(c => (
-                      <option key={c.id} value={c.id}>[{c.clo_code}] {c.description}</option>
-                    ))}
-                  </select>
-                </div>
-
-                <div style={styles.editorActionRow}>
-                  <button type="submit" style={styles.saveEditorBtn}>Lưu cập nhật</button>
-                  <button type="button" onClick={() => setEditingQuestion(null)} style={styles.cancelEditorBtn}>Hủy</button>
-                </div>
-              </form>
-            </section>
-          ) : null}
+          <QuestionEditorForm
+            editingQuestion={editingQuestion}
+            setEditingQuestion={setEditingQuestion}
+            clos={clos}
+            handleUpdateQuestion={handleUpdateQuestion}
+            styles={styles}
+          />
 
           {/* DANH SÁCH CÂU HỎI */}
           <div style={styles.questionsList}>
-            <div style={styles.listHeader}>
+            <div style={{...styles.listHeader, display: 'flex', justifyContent: 'space-between', alignItems: 'center', width: '100%', boxSizing: 'border-box'}}>
               <h3 style={{margin: 0, fontSize: '15px', fontWeight: '700'}}>Danh sách Câu hỏi Hiện tại ({questions.length} câu)</h3>
+              <button 
+                onClick={handleCreateManualClick} 
+                style={{
+                  background: 'linear-gradient(135deg, #10b981 0%, #059669 100%)',
+                  color: '#ffffff',
+                  border: 'none',
+                  borderRadius: '8px',
+                  padding: '6px 14px',
+                  fontSize: '12px',
+                  fontWeight: '700',
+                  cursor: 'pointer',
+                  boxShadow: '0 2px 5px rgba(16, 185, 129, 0.2)'
+                }}
+              >
+                ➕ Thêm câu hỏi thủ công
+              </button>
             </div>
 
             {loading ? (
@@ -540,72 +467,21 @@ export default function QuestionBank({ course, onBack, onViewDashboard }) {
                 <p style={{fontSize: '12px', color: '#64748b'}}>Hãy cấu hình bảng AI Generator ở bên trái để sinh tự động.</p>
               </div>
             ) : (
-              questions.map((q, index) => {
-                let opts = [];
-                try {
-                  opts = JSON.parse(q.options_json);
-                } catch(e) {
-                  opts = [];
-                }
-                const linkedClo = clos.find(c => c.id === q.clo_id);
-                
-                return (
-                  <div key={q.id || index} style={styles.questionCard}>
-                    <div style={styles.questionCardHeader}>
-                      <div style={styles.questionCardMeta}>
-                        <span style={styles.idxBadge}>Câu {index + 1}</span>
-                        <span style={styles.bloomTag}>{getBloomText(q.bloom_level)}</span>
-                        {linkedClo && <span style={styles.cloTag}>[{linkedClo.clo_code}] {linkedClo.description.substring(0, 40)}...</span>}
-                      </div>
-                      <div style={styles.actionButtons}>
-                        <button 
-                          onClick={() => handleGenerateIsomorphic(q.id)}
-                          style={styles.actionBtnIso}
-                          title="Sinh câu hỏi tương tự đồng cấu"
-                        >
-                          Clone Tương tự
-                        </button>
-                        <button 
-                          onClick={() => handleEditClick(q)}
-                          style={styles.actionBtnEdit}
-                        >
-                          Sửa
-                        </button>
-                        <button 
-                          onClick={() => handleDeleteQuestion(q.id)}
-                          style={styles.actionBtnDel}
-                        >
-                          Xóa
-                        </button>
-                      </div>
-                    </div>
-
-                    <div style={styles.questionText}>
-                      <strong>{q.question_text}</strong>
-                    </div>
-
-                    <div style={styles.optionsGrid}>
-                      {opts.map((opt, oIdx) => {
-                        const isCorrect = opt === q.correct_answer;
-                        return (
-                          <div 
-                            key={oIdx} 
-                            style={isCorrect ? styles.optionItemCorrect : styles.optionItem}
-                          >
-                            <span style={isCorrect ? styles.optionLabelCorrect : styles.optionLabel}>
-                              {String.fromCharCode(65 + oIdx)}
-                            </span>
-                            <span>{opt}</span>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  </div>
-                );
-              })
+              questions.map((q, index) => (
+                <QuestionCard
+                  key={q.id || index}
+                  q={q}
+                  index={index}
+                  clos={clos}
+                  handleGenerateIsomorphic={handleGenerateIsomorphic}
+                  handleEditClick={handleEditClick}
+                  handleDeleteQuestion={handleDeleteQuestion}
+                  getBloomText={getBloomText}
+                  styles={styles}
+                />
+              ))
             )}
           </div>
-
         </main>
       </div>
     </div>
@@ -852,6 +728,31 @@ const styles = {
     border: '1px solid rgba(239, 68, 68, 0.15)',
     borderRadius: '8px',
     padding: '10px',
+  },
+  toggleDetailBtn: {
+    background: 'none',
+    border: 'none',
+    color: '#a5b4fc',
+    cursor: 'pointer',
+    fontSize: '10px',
+    fontWeight: '700',
+    padding: 0,
+    textDecoration: 'underline',
+    textAlign: 'left',
+  },
+  scrapedContentBox: {
+    background: 'rgba(15, 23, 42, 0.6)',
+    border: '1px solid rgba(255, 255, 255, 0.05)',
+    borderRadius: '6px',
+    padding: '8px',
+    fontSize: '10px',
+    fontFamily: 'Consolas, monospace',
+    color: '#cbd5e1',
+    whiteSpace: 'pre-wrap',
+    maxHeight: '150px',
+    overflowY: 'auto',
+    marginTop: '6px',
+    margin: 0,
   },
   resultTitle: {
     fontSize: '12px',

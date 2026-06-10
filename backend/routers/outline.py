@@ -4,7 +4,7 @@ from pydantic import BaseModel, Field
 from backend.database.session import get_db
 from backend.database.models import Course, CLO, Chapter, User
 from backend.auth import get_current_user
-from backend.utils.llm_client import call_llm_json
+from backend.utils.llm_client import call_llm_json, langfuse
 
 router = APIRouter(prefix="/api/courses", tags=["outline"])
 
@@ -132,8 +132,21 @@ Nhiệm vụ: Dựa vào các Chuẩn đầu ra (CLOs) môn học được cung 
 """
     prompt = f"Môn học: {course.course_name}\nChuẩn đầu ra môn học (CLOs):\n{clos_text}\n\nHãy sinh cấu trúc chương học phù hợp."
     
+    # --- Langfuse: Parent Trace ---
+    outline_trace = None
+    if langfuse:
+        outline_trace = langfuse.trace(
+            name="lesson_outline_generation",
+            metadata={"course_id": course_id, "course_name": course.course_name, "clo_count": len(clos)}
+        )
+    
     try:
-        outline_json = call_llm_json(prompt, system_instruction=system_prompt)
+        outline_json = call_llm_json(
+            prompt, system_instruction=system_prompt,
+            trace_or_span=outline_trace,
+            prompt_name="lesson_outline", prompt_version="v1",
+            metadata={"course_id": course_id}
+        )
         
         # 5. Xóa outline cũ để ghi đè mới
         db.query(Chapter).filter(Chapter.course_id == course_id).delete()
@@ -170,3 +183,63 @@ Nhiệm vụ: Dựa vào các Chuẩn đầu ra (CLOs) môn học được cung 
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Lỗi khi AI sinh dàn ý: {str(e)}"
         )
+
+# --- API GỢI Ý QUERY TÌM KIẾM HỌC THUẬT (AI SEARCH SUGGESTIONS) ---
+
+@router.get("/chapters/{chapter_id}/suggest-queries")
+def suggest_search_queries(
+    chapter_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Dùng AI để gợi ý 5 query tìm kiếm học thuật phù hợp với chương học đang chọn."""
+    # 1. Lấy thông tin chương và môn học, kiểm tra quyền
+    chapter = db.query(Chapter).join(Course).filter(
+        Chapter.id == chapter_id,
+        Course.user_id == current_user.id
+    ).first()
+    if not chapter:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Chương học không tồn tại hoặc bạn không có quyền truy cập."
+        )
+
+    course = db.query(Course).filter(Course.id == chapter.course_id).first()
+
+    # 2. Gọi LLM sinh gợi ý query với input tối giản để tăng tốc độ phản hồi
+    system_prompt = """Bạn là chuyên gia gợi ý tìm kiếm học thuật. Hãy gợi ý 5 cụm từ tìm kiếm (search queries) bằng tiếng Anh (mỗi query từ 3-8 từ) phù hợp nhất để tìm tài liệu tham khảo trên Google Scholar/Wikipedia cho chương học này.
+Trả về JSON đúng định dạng:
+{
+  "suggestions": [
+    "query 1",
+    "query 2",
+    "query 3",
+    "query 4",
+    "query 5"
+  ]
+}"""
+
+    prompt = f"Môn học: {course.course_name}\nChương học: {chapter.title}"
+    if chapter.description:
+        prompt += f"\nMô tả chương: {chapter.description[:150]}"
+
+    try:
+        result = call_llm_json(
+            prompt, system_instruction=system_prompt,
+            prompt_name="search_query_suggestion", prompt_version="v1",
+            metadata={"chapter_id": chapter_id}
+        )
+        suggestions = result.get("suggestions", [])
+        if not suggestions or not isinstance(suggestions, list):
+            raise ValueError("Kết quả AI không hợp lệ.")
+        return {"suggestions": suggestions[:5]}
+    except Exception as e:
+        # Fallback thủ công nhanh nếu AI lỗi/timeout
+        fallback = [
+            f"{chapter.title} lecture notes",
+            f"{chapter.title} tutorial examples",
+            f"{course.course_name} {chapter.title} academic paper",
+            f"{chapter.title} algorithm implementation",
+            f"{chapter.title} Wikipedia"
+        ]
+        return {"suggestions": fallback[:5]}

@@ -48,6 +48,30 @@ export default function Dashboard({ user, onLogout, onSelectCourse }) {
     }
   };
 
+  const handleUpdateCourse = async (course, e) => {
+    e.stopPropagation(); // Ngăn sự kiện click vào Card kích hoạt select course
+    const newCode = prompt('Nhập mã môn học mới:', course.course_code);
+    if (newCode === null) return; // Hủy
+    const newName = prompt('Nhập tên môn học mới:', course.course_name);
+    if (newName === null) return; // Hủy
+
+    if (!newCode.trim() || !newName.trim()) {
+      alert('Mã môn và tên môn không được để trống.');
+      return;
+    }
+
+    try {
+      const response = await client.put(`/api/courses/${course.id}`, {
+        course_code: newCode.trim(),
+        course_name: newName.trim()
+      });
+      setCourses(courses.map(c => c.id === course.id ? response.data : c));
+    } catch (err) {
+      console.error(err);
+      alert('Không thể cập nhật môn học này.');
+    }
+  };
+
   const handleDeleteCourse = async (id, e) => {
     e.stopPropagation(); // Ngăn sự kiện click vào Card kích hoạt select course
     if (!window.confirm('Bạn có chắc chắn muốn xóa môn học này không?')) return;
@@ -60,6 +84,8 @@ export default function Dashboard({ user, onLogout, onSelectCourse }) {
       alert('Không thể xóa môn học này.');
     }
   };
+
+
 
   return (
     <div style={styles.container}>
@@ -126,13 +152,22 @@ export default function Dashboard({ user, onLogout, onSelectCourse }) {
                 >
                   <div style={styles.cardHeader}>
                     <span style={styles.courseBadge}>{course.course_code}</span>
-                    <button 
-                      onClick={(e) => handleDeleteCourse(course.id, e)} 
-                      style={styles.deleteBtn}
-                      title="Xóa môn học"
-                    >
-                      🗑️
-                    </button>
+                    <div style={{ display: 'flex', gap: '8px' }}>
+                      <button 
+                        onClick={(e) => handleUpdateCourse(course, e)} 
+                        style={styles.deleteBtn}
+                        title="Chỉnh sửa môn học"
+                      >
+                        ✏️
+                      </button>
+                      <button 
+                        onClick={(e) => handleDeleteCourse(course.id, e)} 
+                        style={styles.deleteBtn}
+                        title="Xóa môn học"
+                      >
+                        🗑️
+                      </button>
+                    </div>
                   </div>
                   <h4 style={styles.courseName}>{course.course_name}</h4>
                   <div style={styles.cardFooter}>

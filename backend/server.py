@@ -1,5 +1,24 @@
+import os
+import sys
+
+# Ép kiểu mã hóa console sang UTF-8 để không bị crash khi ghi log tiếng Việt trên Windows
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+if hasattr(sys.stderr, "reconfigure"):
+    try:
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+
 import uvicorn
-from fastapi import FastAPI, Request, status
+from fastapi import FastAPI, Request, status, HTTPException as FastAPIHTTPException
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from backend.database.session import engine, Base
@@ -45,16 +64,28 @@ def read_root():
 # Bộ xử lý lỗi toàn cục (Global Exception Handler) - Đảm bảo hệ thống không trả về lỗi crash sập server
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
+    # Nếu là HTTPException thì trả về trực tiếp đúng cấu trúc lỗi gốc
+    if isinstance(exc, (FastAPIHTTPException, StarletteHTTPException)):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": exc.detail}
+        )
+        
     # Log lỗi chi tiết ở server để phục vụ debug
-    print(f"🔥 LỖI HỆ THỐNG TOÀN CỤC: {exc}")
+    exc_str = str(exc)
+    try:
+        print(f"🔥 LỖI HỆ THỐNG TOÀN CỤC: {exc_str}")
+    except Exception:
+        pass
+        
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         content={
             "error": "InternalServerError",
             "message": "Có lỗi hệ thống xảy ra. Hệ thống RAG/API đang tự khôi phục, vui lòng thử lại sau.",
-            "details": str(exc)
+            "details": exc_str
         }
     )
 
 if __name__ == "__main__":
-    uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("backend.server:app", host="0.0.0.0", port=8000, reload=True)

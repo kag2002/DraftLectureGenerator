@@ -59,12 +59,21 @@ def run_test():
     print("3. Chay thu nghiem Web Search Ingestion (Mock mode)...")
     req = WebSearchRequest(query="Cay nhi phan AVL tu can bang")
     
-    res_ingest = web_search_and_ingest(
-        course_id=course.id,
-        req=req,
-        current_user=user,
-        db=db
-    )
+    # Temporarily remove TAVILY_API_KEY to force Mock Search mode for deterministic testing of mock URLs
+    tavily_key = os.environ.get("TAVILY_API_KEY")
+    if "TAVILY_API_KEY" in os.environ:
+        del os.environ["TAVILY_API_KEY"]
+        
+    try:
+        res_ingest = web_search_and_ingest(
+            course_id=course.id,
+            req=req,
+            current_user=user,
+            db=db
+        )
+    finally:
+        if tavily_key is not None:
+            os.environ["TAVILY_API_KEY"] = tavily_key
     
     assert "ingested" in res_ingest
     assert "rejected" in res_ingest

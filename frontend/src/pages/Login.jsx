@@ -3,9 +3,9 @@ import client from '../api/client';
 
 export default function Login({ onLoginSuccess }) {
   const [isRegister, setIsRegister] = useState(false);
-  const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
-  const [fullName, setFullName] = useState('');
+  const [email, setEmail] = useState('prof.khatkhe@vinuni.edu.vn');
+  const [password, setPassword] = useState('VinUni2026!#');
+  const [fullName, setFullName] = useState('GS. Nguyen Khat Khe');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
 

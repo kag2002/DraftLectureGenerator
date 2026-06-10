@@ -1,13 +1,57 @@
-import sys
 import os
+import sys
+
+# Set thread environment variables to prevent OpenMP deadlocks on Windows/WSL
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["TESTING"] = "1"
+
 import json
 # Thêm backend vào path để import
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
+from unittest.mock import patch
 from backend.database.session import engine, Base, SessionLocal
 from backend.database.models import User, Course, CLO, Chapter, Question
 from backend.auth import get_password_hash
 from backend.routers.questions import generate_questions, generate_isomorphic_question, get_matrix_coverage, QuestionGenerateRequest
+
+def mock_call_llm_json(prompt, system_instruction=None, **kwargs):
+    prompt_str = str(prompt).lower()
+    sys_str = str(system_instruction).lower()
+    
+    if "solver" in sys_str or "solve" in prompt_str:
+        solved = "True"
+        if "complexity" in prompt_str or "log n" in prompt_str:
+            solved = "O(log n)"
+        return {
+            "solved_answer": solved,
+            "explanation": "Correct match"
+        }
+    elif "isomorphic" in sys_str or "isomorphic" in prompt_str or "đồng cấu" in prompt_str or "dong cau" in prompt_str:
+        return {
+            "question_text": "Isomorphic AVL tree question: Is worst-case search in AVL O(log n)?",
+            "options_json": ["Yes", "No"],
+            "correct_answer": "Yes",
+            "bloom_level": 3
+        }
+    else:
+        return {
+            "questions": [
+                {
+                    "question_text": "AVL tree is a self-balancing binary search tree. True or False?",
+                    "options_json": ["True", "False"],
+                    "correct_answer": "True",
+                    "bloom_level": 3
+                },
+                {
+                    "question_text": "What is the time complexity of AVL insertion in the worst case?",
+                    "options_json": ["O(1)", "O(log n)", "O(n)", "O(n log n)"],
+                    "correct_answer": "O(log n)",
+                    "bloom_level": 3
+                }
+            ]
+        }
 
 def run_test():
     print("[TEST] Bat dau chay test suite cho he thong Assessment (Sinh Cau hoi & Matrix)...")
@@ -48,66 +92,92 @@ def run_test():
     db.commit()
     db.refresh(chapter)
 
-    # 3. Kiem thu API sinh cau hoi MCQ voi Self-Correction (mock mode)
-    print("2. Chay thu nghiem AI MCQ Generation voi Self-Correction...")
-    req_data = QuestionGenerateRequest(
-        clo_id=clo1.id,
-        chapter_id=chapter.id,
-        bloom_level=3,
-        count=2
-    )
-    
-    # Goi truc tiep endpoint function nhu mot service thong thuong
-    res = generate_questions(
-        course_id=course.id,
-        req=req_data,
-        current_user=user,
-        db=db
-    )
-    
-    assert "questions" in res
-    assert len(res["questions"]) == 2
-    for q in res["questions"]:
-        assert 1 <= q["bloom_level"] <= 6
-        assert q["clo_id"] == clo1.id
-        assert q["correct_answer"] != ""
-        print(f"   - Sinh thanh cong: {q['question_text'][:50]}... | Dap an: {q['correct_answer']}")
+    with patch("backend.routers.questions.call_llm_json", side_effect=mock_call_llm_json):
+        # 3. Kiem thu API sinh cau hoi MCQ voi Self-Correction (mock mode)
+        print("2. Chay thu nghiem AI MCQ Generation voi Self-Correction...")
+        req_data = QuestionGenerateRequest(
+            clo_id=clo1.id,
+            chapter_id=chapter.id,
+            bloom_level=3,
+            count=2
+        )
         
-    # Lay ID cau hoi de test isomorphic
-    q_id = res["questions"][0]["id"]
+        # Goi truc tiep endpoint function nhu mot service thong thuong
+        res = generate_questions(
+            course_id=course.id,
+            req=req_data,
+            current_user=user,
+            db=db
+        )
+        
+        assert "questions" in res
+        assert len(res["questions"]) == 2
+        for q in res["questions"]:
+            assert 1 <= q["bloom_level"] <= 6
+            assert q["clo_id"] == clo1.id
+            assert q["correct_answer"] != ""
+            print(f"   - Sinh thanh cong: {q['question_text'][:50]}... | Dap an: {q['correct_answer']}")
+            
+        # 3b. Kiem thu API sinh cau hoi MCQ voi Fast Mode (bypassing Self-Correction)
+        print("2b. Chay thu nghiem AI MCQ Generation voi Fast Mode...")
+        req_data_fast = QuestionGenerateRequest(
+            clo_id=clo1.id,
+            chapter_id=chapter.id,
+            bloom_level=3,
+            count=2,
+            fast_mode=True
+        )
+        
+        res_fast = generate_questions(
+            course_id=course.id,
+            req=req_data_fast,
+            current_user=user,
+            db=db
+        )
+        
+        assert "questions" in res_fast
+        assert len(res_fast["questions"]) == 2
+        for q in res_fast["questions"]:
+            assert 1 <= q["bloom_level"] <= 6
+            assert q["clo_id"] == clo1.id
+            assert q["correct_answer"] != ""
+            print(f"   - (Fast Mode) Sinh thanh cong: {q['question_text'][:50]}... | Dap an: {q['correct_answer']}")
 
-    # 4. Kiem thu sinh cau hoi isomorphic (dong cau)
-    print("3. Chay thu nghiem sinh cau hoi tuong tu (Isomorphic)...")
-    res_iso = generate_isomorphic_question(
-        question_id=q_id,
-        current_user=user,
-        db=db
-    )
-    
-    assert "question" in res_iso
-    iso_q = res_iso["question"]
-    assert 1 <= iso_q["bloom_level"] <= 6
-    assert iso_q["clo_id"] == clo1.id
-    assert iso_q["question_text"] != ""
-    print(f"   - Sinh isomorphic: {iso_q['question_text'][:50]}...")
+        # Lay ID cau hoi de test isomorphic
+        q_id = res["questions"][0]["id"]
 
-    # 5. Kiem thu lay ma tran bao phu CLO-Bloom
-    print("4. Kiem tra tinh toan ma tran do bao phu CLO-Bloom...")
-    res_matrix = get_matrix_coverage(
-        course_id=course.id,
-        current_user=user,
-        db=db
-    )
-    
-    assert "matrix" in res_matrix
-    matrix = res_matrix["matrix"]
-    assert "CLO1" in matrix
-    assert "CLO2" in matrix
-    # CLO1 phai co 3 cau hoi tong cong (2 cau goc + 1 cau isomorphic)
-    total_q_clo1 = sum(matrix["CLO1"]["levels"].values())
-    assert total_q_clo1 == 3
-    assert matrix["CLO1"]["levels"]["4"] == 0
-    print(f"   - Ma tran bao phu chinh xac: CLO1 tong cong co {total_q_clo1} cau hoi.")
+        # 4. Kiem thu sinh cau hoi isomorphic (dong cau)
+        print("3. Chay thu nghiem sinh cau hoi tuong tu (Isomorphic)...")
+        res_iso = generate_isomorphic_question(
+            question_id=q_id,
+            current_user=user,
+            db=db
+        )
+        
+        assert "question" in res_iso
+        iso_q = res_iso["question"]
+        assert 1 <= iso_q["bloom_level"] <= 6
+        assert iso_q["clo_id"] == clo1.id
+        assert iso_q["question_text"] != ""
+        print(f"   - Sinh isomorphic: {iso_q['question_text'][:50]}...")
+
+        # 5. Kiem thu lay ma tran bao phu CLO-Bloom
+        print("4. Kiem tra tinh toan ma tran do bao phu CLO-Bloom...")
+        res_matrix = get_matrix_coverage(
+            course_id=course.id,
+            current_user=user,
+            db=db
+        )
+        
+        assert "matrix" in res_matrix
+        matrix = res_matrix["matrix"]
+        assert "CLO1" in matrix
+        assert "CLO2" in matrix
+        # CLO1 phai co 5 cau hoi tong cong (2 tu self-correction, 2 tu fast mode, 1 tu isomorphic)
+        total_q_clo1 = sum(matrix["CLO1"]["levels"].values())
+        assert total_q_clo1 == 5
+        assert matrix["CLO1"]["levels"]["4"] == 0
+        print(f"   - Ma tran bao phu chinh xac: CLO1 tong cong co {total_q_clo1} cau hoi.")
 
     # 6. Don dep du lieu
     print("5. Don dep tai khoan va mon hoc test...")

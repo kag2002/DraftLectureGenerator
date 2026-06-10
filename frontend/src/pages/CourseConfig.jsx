@@ -1,7 +1,8 @@
 import React, { useState, useEffect } from 'react';
 import client from '../api/client';
+import FlowSteps from '../components/FlowSteps';
 
-export default function CourseConfig({ course, onBack, onStartPlanning }) {
+export default function CourseConfig({ course, onBack, onNavigate, onStartPlanning }) {
   const [clos, setClos] = useState([]);
   const [file, setFile] = useState(null);
   const [rawText, setRawText] = useState('');
@@ -11,6 +12,9 @@ export default function CourseConfig({ course, onBack, onStartPlanning }) {
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
+
+  const [streamLog, setStreamLog] = useState('');
+  const [streamStage, setStreamStage] = useState(0); // 0 -> 4
 
   // Lấy các CLO hiện có của môn học từ API
   const fetchClos = async () => {
@@ -30,7 +34,7 @@ export default function CourseConfig({ course, onBack, onStartPlanning }) {
     fetchClos();
   }, [course.id]);
 
-  // Xử lý upload file Syllabus và gửi API parse
+  // Xử lý upload file Syllabus và gửi API parse bằng Stream SSE
   const handleFileUpload = async (e) => {
     e.preventDefault();
     if (!file && !useTextarea) {
@@ -41,37 +45,96 @@ export default function CourseConfig({ course, onBack, onStartPlanning }) {
     setError('');
     setMessage('');
     setLoading(true);
+    setStreamLog('🚀 Đang kết nối tới AI...');
+    setStreamStage(0);
+    setClos([]); // Xóa danh sách cũ để cập nhật mới từ stream
+
+    const token = localStorage.getItem('token');
 
     try {
+      let finalFile;
       if (useTextarea) {
-        // Nếu dùng copy-paste thô (giả lập upload file TXT tạm thời)
         const blob = new Blob([rawText], { type: 'text/plain' });
-        const textFile = new File([blob], 'syllabus_pasted.txt', { type: 'text/plain' });
-        
-        const formData = new FormData();
-        formData.append('file', textFile);
-
-        const response = await client.post(`/api/courses/${course.id}/parse-syllabus`, formData, {
-          headers: { 'Content-Type': 'multipart/form-data' }
-        });
-        setClos(response.data.clos);
-        setMessage('Đã phân tích văn bản Syllabus thành công!');
+        finalFile = new File([blob], 'syllabus_pasted.txt', { type: 'text/plain' });
       } else {
-        // Nếu tải file PDF/Docx
-        const formData = new FormData();
-        formData.append('file', file);
+        finalFile = file;
+      }
 
-        const response = await client.post(`/api/courses/${course.id}/parse-syllabus`, formData, {
-          headers: { 'Content-Type': 'multipart/form-data' }
-        });
-        setClos(response.data.clos);
-        setMessage('Đã phân tích file Syllabus thành công!');
+      const formData = new FormData();
+      formData.append('file', finalFile);
+
+      const response = await fetch(
+        `http://localhost:8000/api/courses/${course.id}/parse-syllabus-stream`,
+        {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${token}`
+          },
+          body: formData
+        }
+      );
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        throw new Error(errorData.detail || errorData.message || `Lỗi server: ${response.status}`);
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop();
+
+        let currentEvent = '';
+        for (const line of lines) {
+          if (line.startsWith('event: ')) {
+            currentEvent = line.slice(7).trim();
+          } else if (line.startsWith('data: ')) {
+            try {
+              const data = JSON.parse(line.slice(6));
+              
+              if (currentEvent === 'stage') {
+                setStreamStage(data.stage);
+                setStreamLog(data.message);
+              } else if (currentEvent === 'clo') {
+                // Thêm dần CLO nhận được từ stream để hiển thị thời gian thực
+                setClos(prev => {
+                  if (prev.some(c => c.id === data.clo.id || c.clo_code === data.clo.clo_code)) {
+                    return prev.map(c => c.clo_code === data.clo.clo_code ? data.clo : c);
+                  }
+                  return [...prev, data.clo];
+                });
+                setStreamLog(`✅ Đã trích xuất CLO ${data.index}/${data.total}: ${data.clo.clo_code}`);
+              } else if (currentEvent === 'done') {
+                setClos(data.clos);
+                setMessage(data.message);
+                setLoading(false);
+                setStreamLog('');
+                setStreamStage(0);
+              } else if (currentEvent === 'error') {
+                setError(data.message);
+                setLoading(false);
+                setStreamLog('');
+                setStreamStage(0);
+              }
+            } catch (jsonErr) {
+              console.error("Lỗi parse JSON stream:", jsonErr);
+            }
+          }
+        }
       }
     } catch (err) {
       console.error(err);
-      setError(err.response?.data?.detail || 'Lỗi khi phân tích Syllabus. Vui lòng thử lại.');
-    } finally {
+      setError(`Lỗi phân tích Syllabus: ${err.message}`);
       setLoading(false);
+      setStreamLog('');
+      setStreamStage(0);
     }
   };
 
@@ -126,7 +189,8 @@ export default function CourseConfig({ course, onBack, onStartPlanning }) {
       fetchClos();
     } catch (err) {
       console.error(err);
-      setError('Lỗi khi lưu danh sách CLO.');
+      const errMsg = err.response?.data?.detail || err.response?.data?.message || err.response?.data?.details || 'Lỗi khi lưu danh sách CLO.';
+      setError(typeof errMsg === 'object' ? JSON.stringify(errMsg) : errMsg);
     } finally {
       setSaving(false);
     }
@@ -136,12 +200,13 @@ export default function CourseConfig({ course, onBack, onStartPlanning }) {
     <div style={styles.container}>
       <header style={styles.header}>
         <div style={styles.headerLeft}>
-          <button onClick={onBack} style={styles.backBtn}>← Quay lại Dashboard</button>
+          <button onClick={onBack} style={styles.backBtn}>← Sơ đồ</button>
           <div>
             <span style={styles.badge}>{course.course_code}</span>
             <h2 style={styles.courseTitle}>{course.course_name}</h2>
           </div>
         </div>
+        {onNavigate && <FlowSteps activeStep="syllabus" onNavigate={onNavigate} />}
         <div>
           <button onClick={onStartPlanning} style={styles.startPlanningBtn}>
             Bắt đầu soạn bài (AI Planner) →
@@ -210,6 +275,31 @@ export default function CourseConfig({ course, onBack, onStartPlanning }) {
               {loading ? 'Đang phân tích (LLM)...' : 'Bắt đầu phân tích Syllabus (AI)'}
             </button>
           </form>
+
+          {loading && streamStage > 0 && (
+            <div style={styles.progressContainer}>
+              <div style={styles.progressBarWrapper}>
+                <div 
+                  style={{
+                    ...styles.progressBar,
+                    width: `${(streamStage / 4) * 100}%`,
+                    background: streamStage === 4 
+                      ? 'linear-gradient(90deg, #10b981 0%, #059669 100%)' 
+                      : 'linear-gradient(90deg, #6366f1 0%, #a855f7 100%)'
+                  }}
+                />
+              </div>
+              <div style={styles.progressText}>
+                <span>Giai đoạn {streamStage}/4</span>
+                <span>{Math.round((streamStage / 4) * 100)}%</span>
+              </div>
+              {streamLog && (
+                <div style={styles.streamLogText}>
+                  <span style={styles.pulseDot} /> {streamLog}
+                </div>
+              )}
+            </div>
+          )}
         </section>
 
         {/* CỘT PHẢI: MAPPER CLO & BLOOM TAXONOMY */}
@@ -219,12 +309,15 @@ export default function CourseConfig({ course, onBack, onStartPlanning }) {
             <button onClick={handleAddRow} style={styles.addBtn}>+ Thêm CLO</button>
           </div>
 
-          {loading ? (
-            <div style={styles.loadingState}>Đang xử lý phân tích dữ liệu...</div>
-          ) : clos.length === 0 ? (
+          {clos.length === 0 && !loading ? (
             <div style={styles.emptyState}>
               <p>Chưa cấu hình Chuẩn đầu ra môn học.</p>
               <p style={{fontSize: '12px', color: '#64748b'}}>Hãy upload Syllabus ở bên trái để AI tự động trích xuất.</p>
+            </div>
+          ) : clos.length === 0 && loading ? (
+            <div style={styles.loadingState}>
+              <div style={styles.spinner} />
+              <p style={{marginTop: '15px', color: '#94a3b8', fontSize: '13px'}}>AI đang khởi động phân tích đề cương...</p>
             </div>
           ) : (
             <div style={styles.list}>
@@ -563,5 +656,57 @@ const styles = {
     borderRadius: '10px',
     fontSize: '13px',
     marginBottom: '20px',
+  },
+  progressContainer: {
+    marginTop: '20px',
+    background: 'rgba(15, 23, 42, 0.4)',
+    border: '1px solid rgba(255, 255, 255, 0.05)',
+    borderRadius: '12px',
+    padding: '15px',
+  },
+  progressBarWrapper: {
+    background: 'rgba(255, 255, 255, 0.05)',
+    borderRadius: '8px',
+    height: '8px',
+    overflow: 'hidden',
+    marginBottom: '10px',
+  },
+  progressBar: {
+    height: '100%',
+    transition: 'width 0.4s ease-out',
+  },
+  progressText: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    fontSize: '12px',
+    color: '#94a3b8',
+    fontWeight: '600',
+    marginBottom: '10px',
+  },
+  streamLogText: {
+    fontSize: '13px',
+    color: '#cbd5e1',
+    display: 'flex',
+    alignItems: 'center',
+    gap: '8px',
+    lineHeight: '1.4',
+  },
+  pulseDot: {
+    width: '8px',
+    height: '8px',
+    borderRadius: '50%',
+    background: '#818cf8',
+    boxShadow: '0 0 8px #818cf8',
+    display: 'inline-block',
+    animation: 'pulse 1.5s infinite',
+  },
+  spinner: {
+    width: '36px',
+    height: '36px',
+    border: '3px solid rgba(99, 102, 241, 0.1)',
+    borderTop: '3px solid #6366f1',
+    borderRadius: '50%',
+    margin: '0 auto',
+    animation: 'spin 1s linear infinite',
   }
 };

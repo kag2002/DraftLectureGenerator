@@ -37,3 +37,8 @@ backend/data/vector_db/
 # OS
 .DS_Store
 Thumbs.db
+
+# Temp and Scratch
+scratch/
+temp/
+dummy_syllabus.txt

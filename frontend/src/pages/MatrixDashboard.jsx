@@ -1,10 +1,31 @@
 import React, { useState, useEffect } from 'react';
 import client from '../api/client';
+import FlowSteps from '../components/FlowSteps';
 
-export default function MatrixDashboard({ course, onBack }) {
+export default function MatrixDashboard({ 
+  course, 
+  onBack, 
+  onNavigate,
+  queue,
+  isQueueRunning,
+  showQueuePanel,
+  queueProgressMsg,
+  setIsQueueRunning,
+  setQueue,
+  setShowQueuePanel,
+  setQueueProgressMsg,
+  setQueueMode,
+  cancelRef,
+  runGlobalQueue
+}) {
   const [matrixData, setMatrixData] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [activeMode, setActiveMode] = useState('questions'); // 'questions' | 'materials'
+
+  // States & Refs cho hàng đợi tự động khắc phục điểm mù
+  const [chapters, setChapters] = useState([]);
+  const prevSuccessCount = React.useRef(0);
 
   const fetchMatrix = async () => {
     setLoading(true);
@@ -19,9 +40,92 @@ export default function MatrixDashboard({ course, onBack }) {
     }
   };
 
+  const fetchMatrixSilent = async () => {
+    try {
+      const response = await client.get(`/api/courses/${course.id}/matrix-coverage`);
+      setMatrixData(response.data.matrix);
+    } catch (err) {
+      console.error("fetchMatrixSilent error:", err);
+    }
+  };
+
+  const fetchChapters = async () => {
+    try {
+      const response = await client.get(`/api/courses/${course.id}/chapters`);
+      setChapters(response.data);
+    } catch (err) {
+      console.error("fetchChapters error:", err);
+    }
+  };
+
   useEffect(() => {
     fetchMatrix();
+    fetchChapters();
   }, [course.id]);
+
+  // Theo dõi hàng đợi toàn cục: khi có bất kỳ mục nào thành công, tự động reload ma trận
+  useEffect(() => {
+    if (queue && queue.length > 0) {
+      const successCount = queue.filter(q => q.status === 'success').length;
+      if (successCount !== prevSuccessCount.current) {
+        prevSuccessCount.current = successCount;
+        fetchMatrixSilent();
+      }
+    } else {
+      prevSuccessCount.current = 0;
+    }
+  }, [queue]);
+
+  // Tìm chương học liên quan đến mã CLO dựa trên tiêu đề/mô tả
+  const findChapterForClo = (cloCode) => {
+    if (!chapters || chapters.length === 0) return null;
+    const matched = chapters.find(ch => 
+      (ch.title && ch.title.toLowerCase().includes(cloCode.toLowerCase())) ||
+      (ch.description && ch.description.toLowerCase().includes(cloCode.toLowerCase()))
+    );
+    return matched ? matched.id : chapters[0].id;
+  };
+
+  // Khởi tạo hàng đợi chứa các điểm mù chất lượng của ma trận hiện tại
+  const handleInitQueue = () => {
+    if (isQueueRunning) {
+      alert('Hàng đợi đang chạy dưới nền. Vui lòng Tạm dừng (Pause) hoặc Đóng hàng đợi hiện tại trước khi khởi tạo hàng đợi mới');
+      return;
+    }
+    if (!matrixData) return;
+    const newQueue = [];
+    const cloCodes = Object.keys(matrixData);
+    
+    cloCodes.forEach(code => {
+      const clo = matrixData[code];
+      const targetLvl = clo.target_bloom;
+      const levels = activeMode === 'questions' ? (clo.question_levels || clo.levels) : clo.material_levels;
+      const count = levels[String(targetLvl)] || 0;
+      
+      if (count === 0) {
+        newQueue.push({
+          cloId: clo.clo_id,
+          cloCode: code,
+          bloomLevel: targetLvl,
+          chapterId: findChapterForClo(code),
+          status: 'pending',
+          errorMsg: '',
+          activeStageMessage: ''
+        });
+      }
+    });
+    
+    if (newQueue.length === 0) {
+      alert('Tuyệt vời! Hiện tại không có điểm mù nào cần khắc phục.');
+      return;
+    }
+    
+    setQueue(newQueue);
+    setQueueMode(activeMode);
+    setShowQueuePanel(true);
+    setIsQueueRunning(false);
+    setQueueProgressMsg('Hàng đợi đã sẵn sàng. Hãy bấm "Bắt đầu" để khởi chạy.');
+  };
 
   if (loading) {
     return (
@@ -33,9 +137,12 @@ export default function MatrixDashboard({ course, onBack }) {
 
   // 1. Tính toán thống kê tổng quan
   let totalQuestions = 0;
+  let totalSlides = 0;
   let totalClos = 0;
-  let coveredClos = 0;
-  let blindSpotsCount = 0;
+  let coveredClosQ = 0;
+  let coveredClosM = 0;
+  let blindSpotsCountQ = 0;
+  let blindSpotsCountM = 0;
 
   if (matrixData) {
     const cloCodes = Object.keys(matrixData);
@@ -43,26 +150,35 @@ export default function MatrixDashboard({ course, onBack }) {
 
     cloCodes.forEach(code => {
       const clo = matrixData[code];
-      const levels = clo.levels;
+      const targetLvlStr = str(clo.target_bloom);
       
-      // Tính tổng câu hỏi
+      // Câu hỏi
+      const qLevels = clo.question_levels || clo.levels || {};
       let qCount = 0;
-      Object.keys(levels).forEach(lvl => {
-        qCount += levels[lvl];
+      Object.keys(qLevels).forEach(lvl => {
+        qCount += qLevels[lvl] || 0;
       });
       totalQuestions += qCount;
+      if (qCount > 0) coveredClosQ += 1;
+      if ((qLevels[targetLvlStr] || 0) === 0) {
+        blindSpotsCountQ += 1;
+      }
 
-      // Đánh giá covered
-      if (qCount > 0) coveredClos += 1;
-
-      // Đánh giá Blind Spot
-      // Điểm mù là khi mức Bloom mục tiêu (target_bloom) có 0 câu hỏi bao phủ
-      const targetLvlStr = str(clo.target_bloom);
-      if (levels[targetLvlStr] === 0) {
-        blindSpotsCount += 1;
+      // Slide/Học liệu
+      const mLevels = clo.material_levels || {};
+      let mCount = 0;
+      Object.keys(mLevels).forEach(lvl => {
+        mCount += mLevels[lvl] || 0;
+      });
+      totalSlides += mCount;
+      if (mCount > 0) coveredClosM += 1;
+      if ((mLevels[targetLvlStr] || 0) === 0) {
+        blindSpotsCountM += 1;
       }
     });
   }
+
+  const blindSpotsCount = activeMode === 'questions' ? blindSpotsCountQ : blindSpotsCountM;
 
   // Helper chuyển đổi số sang string cho an toàn
   function str(val) {
@@ -79,49 +195,126 @@ export default function MatrixDashboard({ course, onBack }) {
       {/* HEADER */}
       <header style={styles.header}>
         <div style={styles.headerLeft}>
-          <button onClick={onBack} style={styles.backBtn}>← Quay lại Ngân hàng câu hỏi</button>
+          <button onClick={onBack} style={styles.backBtn}>← Sơ đồ</button>
           <div>
             <span style={styles.badge}>{course.course_code}</span>
             <h2 style={styles.courseTitle}>Báo Cáo Độ Phủ Ma Trận CLO - Bloom</h2>
           </div>
         </div>
+        {onNavigate && <FlowSteps activeStep="matrix" onNavigate={onNavigate} />}
       </header>
 
       {error && <div style={styles.errorAlert}>{error}</div>}
 
       {matrixData && (
         <div style={styles.content}>
+          {/* TAB MODE SELECTOR */}
+          <div style={styles.tabContainer}>
+            <button 
+              onClick={() => {
+                if (isQueueRunning) {
+                  alert('Hàng đợi đang chạy dưới nền. Vui lòng Tạm dừng (Pause) hoặc Đóng hàng đợi hiện tại trước khi chuyển đổi chế độ.');
+                  return;
+                }
+                setActiveMode('questions');
+              }} 
+              style={activeMode === 'questions' ? styles.activeTabBtn : styles.inactiveTabBtn}
+            >
+              📝 Ma trận Đề thi (Câu hỏi)
+            </button>
+            <button 
+              onClick={() => {
+                if (isQueueRunning) {
+                  alert('Hàng đợi đang chạy dưới nền. Vui lòng Tạm dừng (Pause) hoặc Đóng hàng đợi hiện tại trước khi chuyển đổi chế độ.');
+                  return;
+                }
+                setActiveMode('materials');
+              }} 
+              style={activeMode === 'materials' ? styles.activeTabBtn : styles.inactiveTabBtn}
+            >
+              🖼️ Ma trận Bài giảng (Nội dung)
+            </button>
+          </div>
+
           {/* STATS OVERVIEW CARDS */}
           <div style={styles.statsRow}>
             <div style={styles.statCard}>
-              <div style={styles.statLabel}>Tổng số Câu hỏi</div>
-              <div style={styles.statValue}>{totalQuestions}</div>
-              <div style={styles.statSub}>Đã lưu trữ trong ngân hàng đề</div>
+              <div style={styles.statLabel}>{activeMode === 'questions' ? 'Tổng số Câu hỏi' : 'Tổng số Slide bài giảng'}</div>
+              <div style={styles.statValue}>{activeMode === 'questions' ? totalQuestions : totalSlides}</div>
+              <div style={styles.statSub}>{activeMode === 'questions' ? 'Đã lưu trữ trong ngân hàng đề' : 'Đã thiết kế trong các chương học'}</div>
             </div>
             
             <div style={styles.statCard}>
-              <div style={styles.statLabel}>Độ bao phủ CLOs</div>
+              <div style={styles.statLabel}>{activeMode === 'questions' ? 'Độ bao phủ CLOs (Câu hỏi)' : 'Độ bao phủ CLOs (Slide)'}</div>
               <div style={styles.statValue}>
-                {coveredClos}/{totalClos}
+                {activeMode === 'questions' ? `${coveredClosQ}/${totalClos}` : `${coveredClosM}/${totalClos}`}
               </div>
               <div style={styles.statSub}>
-                {totalClos > 0 ? `${((coveredClos/totalClos)*100).toFixed(0)}%` : '0%'} chuẩn đầu ra đã có câu hỏi
+                {totalClos > 0 ? `${(((activeMode === 'questions' ? coveredClosQ : coveredClosM)/totalClos)*100).toFixed(0)}%` : '0%'} chuẩn đầu ra đã được bao phủ
               </div>
             </div>
 
             <div style={styles.statCardDanger}>
               <div style={styles.statLabel}>Điểm mù Chất lượng (Blind Spots)</div>
-              <div style={styles.statValue}>{blindSpotsCount}</div>
-              <div style={styles.statSubDanger}>CLOs chưa có câu hỏi đúng mức Bloom quy định</div>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: '10px', marginBottom: '5px' }}>
+                <div style={{ ...styles.statValue, margin: 0 }}>{activeMode === 'questions' ? blindSpotsCountQ : blindSpotsCountM}</div>
+                {blindSpotsCount > 0 && (
+                  <button 
+                    onClick={handleInitQueue}
+                    style={{
+                      background: 'linear-gradient(135deg, #ef4444 0%, #dc2626 100%)',
+                      color: '#ffffff',
+                      border: 'none',
+                      borderRadius: '8px',
+                      padding: '8px 14px',
+                      fontSize: '12px',
+                      fontWeight: '700',
+                      cursor: 'pointer',
+                      boxShadow: '0 4px 10px rgba(239, 68, 68, 0.3)',
+                      transition: 'transform 0.2s',
+                    }}
+                    title="Tự động khởi chạy hàng đợi sửa chữa tất cả điểm mù chất lượng qua AI"
+                  >
+                    ⚡ Khắc phục hàng loạt
+                  </button>
+                )}
+              </div>
+              <div style={styles.statSubDanger}>{activeMode === 'questions' ? 'CLOs chưa có câu hỏi đúng mức Bloom quy định' : 'CLOs chưa có nội dung slide đúng mức Bloom quy định'}</div>
             </div>
           </div>
 
+          {/* BLIND SPOTS ALERTS SECTION */}
+          {blindSpotsCount > 0 && (
+            <div style={styles.blindSpotsSection}>
+              <h4 style={styles.blindSpotsTitle}>🚨 Danh sách Điểm Mù Chất lượng cần khắc phục ({activeMode === 'questions' ? 'Đánh giá' : 'Giảng dạy'}):</h4>
+              <div style={styles.blindSpotsList}>
+                {Object.keys(matrixData).map(code => {
+                  const clo = matrixData[code];
+                  const targetLvl = clo.target_bloom;
+                  const levels = activeMode === 'questions' ? (clo.question_levels || clo.levels) : clo.material_levels;
+                  const count = levels[str(targetLvl)] || 0;
+                  if (count === 0) {
+                    return (
+                      <div key={code} style={styles.blindSpotAlert}>
+                        <strong>Chuẩn đầu ra {code}:</strong> Chưa có {activeMode === 'questions' ? 'câu hỏi trắc nghiệm' : 'nội dung slide'} nào phục vụ mức nhận thức mục tiêu <strong>{getBloomHeader(targetLvl)}</strong>.
+                        <p style={{ margin: '4px 0 0 0', fontSize: '12px', color: '#fca5a5' }}>
+                          * Gợi ý: {activeMode === 'questions' ? `Hãy mở Ngân hàng câu hỏi, chọn chuẩn đầu ra ${code} và chọn mức Bloom ${targetLvl} để sinh thêm câu hỏi tương ứng.` : `Hãy mở Soạn bài giảng, chọn chương học liên quan đến ${code} để bổ sung nội dung slide giảng dạy mức Bloom ${targetLvl}.`}
+                        </p>
+                      </div>
+                    );
+                  }
+                  return null;
+                })}
+              </div>
+            </div>
+          )}
+
           {/* HEATMAP TABLE */}
           <section style={styles.heatmapCard}>
-            <h3 style={styles.sectionTitle}>Ma trận Phủ Chuẩn đầu ra (Bloom x CLO Heatmap)</h3>
+            <h3 style={styles.sectionTitle}>Ma trận Phủ Chuẩn đầu ra (Bloom x CLO Heatmap) — {activeMode === 'questions' ? 'Góc nhìn Đánh giá' : 'Góc nhìn Giảng dạy'}</h3>
             <p style={styles.sectionSub}>
               Cột dọc đại diện cho chuẩn đầu ra (CLO), cột ngang đại diện cho các mức nhận thức Bloom.
-              Màu tím đậm biểu thị mức độ phủ cao. Ô có đường viền nét đứt <strong style={{color: '#f87171'}}>màu đỏ</strong> có icon ⚠️ chính là <strong>Điểm mù (Blind Spot)</strong> cần bổ sung câu hỏi gấp.
+              Màu tím đậm biểu thị mức độ phủ cao. Ô có đường viền nét đứt <strong style={{color: '#f87171'}}>màu đỏ</strong> có icon ⚠️ chính là <strong>Điểm mù (Blind Spot)</strong> cần bổ sung câu hỏi/nội dung giảng dạy gấp.
             </p>
 
             <div style={styles.tableWrapper}>
@@ -148,22 +341,25 @@ export default function MatrixDashboard({ course, onBack }) {
                           <span style={styles.targetBadge}>B{clo.target_bloom}</span>
                         </td>
                         {[1, 2, 3, 4, 5, 6].map(b => {
-                          const count = clo.levels[str(b)] || 0;
+                          const levels = activeMode === 'questions' ? (clo.question_levels || clo.levels) : clo.material_levels;
+                          const count = levels[str(b)] || 0;
                           const isTarget = clo.target_bloom === b;
                           const isBlindSpot = isTarget && count === 0;
                           
-                          // Tính toán background color dựa trên số câu hỏi
+                          // Tính toán background color dựa trên số câu hỏi/slides
                           let bg = 'rgba(15, 23, 42, 0.3)';
                           let border = '1px solid rgba(255, 255, 255, 0.04)';
                           
                           if (count > 0) {
                             const opacity = Math.min(0.9, 0.15 + count * 0.18);
-                            bg = `rgba(99, 102, 241, ${opacity})`;
+                            // Dùng màu tím Indigo cho câu hỏi, màu ngọc lục bảo Emerald/Teal cho slide học liệu
+                            const rgbColor = activeMode === 'questions' ? '99, 102, 241' : '20, 184, 166';
+                            bg = `rgba(${rgbColor}, ${opacity})`;
                           } else if (isBlindSpot) {
                             bg = 'rgba(239, 68, 68, 0.08)';
                             border = '2px dashed rgba(239, 68, 68, 0.5)';
                           } else if (isTarget) {
-                            // Ô mục tiêu nhưng hiện tại rỗng và không bị đánh là blind spot (ví dụ level rỗng khác)
+                            // Ô mục tiêu nhưng hiện tại rỗng
                             bg = 'rgba(255, 255, 255, 0.02)';
                             border = '1px dashed rgba(255, 255, 255, 0.2)';
                           }
@@ -171,21 +367,34 @@ export default function MatrixDashboard({ course, onBack }) {
                           return (
                             <td 
                               key={b} 
+                              className="matrix-cell-clickable"
                               style={{
                                 ...styles.tdCell,
                                 backgroundColor: bg,
                                 border: border
                               }}
+                              onClick={() => {
+                                onNavigate(activeMode === 'questions' ? 'question_bank' : 'lesson_planner', {
+                                  cloId: clo.clo_id,
+                                  cloCode: code,
+                                  bloomLevel: b
+                                });
+                              }}
+                              title={
+                                isBlindSpot 
+                                  ? `Nhấn để khắc phục điểm mù: Thêm ${activeMode === 'questions' ? 'câu hỏi' : 'bài giảng'} còn thiếu cho ${code} - Mức Bloom B${b}` 
+                                  : `Thống kê ${code} - Bloom B${b}: có ${count} mục. Nhấn để chuyển đến trang chi tiết.`
+                              }
                             >
                               <div style={styles.cellContent}>
                                 <span style={count > 0 ? styles.cellCountActive : styles.cellCount}>
                                   {count}
                                 </span>
                                 {isBlindSpot && (
-                                  <span style={styles.blindWarning} title="Chưa phủ mức Bloom mục tiêu!">⚠️ Mù</span>
+                                  <span style={styles.blindWarning}>⚠️ Thiếu</span>
                                 )}
                                 {isTarget && !isBlindSpot && count > 0 && (
-                                  <span style={styles.targetTick} title="Đạt yêu cầu Bloom mục tiêu">✓ Đạt</span>
+                                  <span style={styles.targetTick}>✓ Đạt</span>
                                 )}
                               </div>
                             </td>
@@ -200,6 +409,8 @@ export default function MatrixDashboard({ course, onBack }) {
           </section>
         </div>
       )}
+
+
     </div>
   );
 }
@@ -440,5 +651,62 @@ const styles = {
     fontWeight: '700',
     padding: '2px 6px',
     borderRadius: '4px',
+  },
+  blindSpotsSection: {
+    background: 'rgba(239, 68, 68, 0.08)',
+    border: '1px solid rgba(239, 68, 68, 0.25)',
+    borderRadius: '16px',
+    padding: '20px 24px',
+  },
+  blindSpotsTitle: {
+    margin: '0 0 15px 0',
+    fontSize: '14px',
+    fontWeight: '700',
+    color: '#f87171',
+    textTransform: 'uppercase',
+  },
+  blindSpotsList: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '12px',
+  },
+  blindSpotAlert: {
+    fontSize: '13px',
+    color: '#fca5a5',
+    lineHeight: '1.4',
+    paddingLeft: '15px',
+    borderLeft: '3px solid #ef4444',
+    textAlign: 'left',
+  },
+  tabContainer: {
+    display: 'flex',
+    gap: '12px',
+    borderBottom: '1px solid rgba(255, 255, 255, 0.08)',
+    paddingBottom: '16px',
+    marginBottom: '10px'
+  },
+  activeTabBtn: {
+    background: 'rgba(99, 102, 241, 0.25)',
+    border: '1px solid #6366f1',
+    color: '#ffffff',
+    borderRadius: '10px',
+    padding: '10px 20px',
+    cursor: 'pointer',
+    fontSize: '13px',
+    fontWeight: '700',
+    transition: 'all 0.2s',
+    outline: 'none'
+  },
+  inactiveTabBtn: {
+    background: 'rgba(255, 255, 255, 0.02)',
+    border: '1px solid rgba(255, 255, 255, 0.08)',
+    color: '#94a3b8',
+    borderRadius: '10px',
+    padding: '10px 20px',
+    cursor: 'pointer',
+    fontSize: '13px',
+    fontWeight: '600',
+    transition: 'all 0.2s',
+    outline: 'none'
   }
 };

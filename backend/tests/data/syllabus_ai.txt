@@ -1,0 +1,9 @@
+COURSE SYLLABUS: COMP3010 - Artificial Intelligence
+
+Description: This course covers foundational concepts of Artificial Intelligence, search algorithms, knowledge representation, and neural networks.
+
+Course Learning Outcomes:
+By the end of this course, students will:
+1. Understand the difference between uninformed search (BFS, DFS) and informed search (A* search, heuristics) strategies in pathfinding.
+2. Apply logic programming and inference engines to resolve propositional logic problems.
+3. Evaluate the performance of basic neural networks (Multi-Layer Perceptrons) in simple classification datasets.

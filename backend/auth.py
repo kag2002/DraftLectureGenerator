@@ -1,7 +1,7 @@
 import bcrypt
 from datetime import datetime, timedelta
 import jwt
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, status, Request
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
 from backend.database.session import get_db
@@ -33,14 +33,23 @@ def create_access_token(data: dict, expires_delta: timedelta = None) -> str:
     return encoded_jwt
 
 # Dependency xác thực token và lấy User hiện tại
-def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
+def get_current_user(request: Request, token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Phiên đăng nhập đã hết hạn hoặc không hợp lệ.",
         headers={"WWW-Authenticate": "Bearer"},
     )
     
-    # Cho phép fallback đọc token từ header Authorization nếu OAuth2PasswordBearer không bắt được (do custom header client)
+    # Fallback to query parameter token for window.open / downloads
+    if not token:
+        token = request.query_params.get("token")
+        
+    # Manual Authorization header check
+    if not token:
+        auth_header = request.headers.get("Authorization")
+        if auth_header and auth_header.startswith("Bearer "):
+            token = auth_header.split(" ")[1]
+            
     if not token:
         raise credentials_exception
 

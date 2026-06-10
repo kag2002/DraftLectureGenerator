@@ -182,3 +182,4 @@
     border-right-color: var(--border);
   }
 }
+@keyframes spin {\n  from { transform: rotate(0deg); }\n  to { transform: rotate(360deg); }\n}

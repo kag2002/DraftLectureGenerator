@@ -1,5 +1,18 @@
 import sys
 import os
+
+# Ép kiểu mã hóa console sang UTF-8 để không bị crash khi ghi log tiếng Việt trên Windows
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+if hasattr(sys.stderr, "reconfigure"):
+    try:
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 # Thêm backend vào path để import
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 

@@ -1,4 +1,4 @@
-from backend.utils.llm_client import call_llm_json
+from backend.utils.llm_client import call_llm_json, langfuse
 
 SYSTEM_INSTRUCTION = """Bạn là chuyên gia sư phạm đại học quốc tế chuyên về kiểm định chất lượng giáo dục (AUN-QA, ABET).
 Nhiệm vụ của bạn là đọc văn bản đề cương môn học (Syllabus) và bóc tách các thông tin khóa học sau:
@@ -33,5 +33,18 @@ QUY TẮC PHÂN TÍCH SƯ PHẠM QUAN TRỌNG:
 
 def analyse_syllabus(syllabus_text: str) -> dict:
     """Gọi LLM phân tích đề cương thô và trả về JSON cấu trúc môn học + CLO."""
+    # --- Langfuse: Parent Trace ---
+    trace = None
+    if langfuse:
+        trace = langfuse.trace(
+            name="syllabus_analysis",
+            metadata={"input_length": len(syllabus_text)}
+        )
     prompt = f"Hãy bóc tách chuẩn đầu ra CLO từ văn bản Syllabus sau đây:\n\n{syllabus_text}"
-    return call_llm_json(prompt, system_instruction=SYSTEM_INSTRUCTION)
+    return call_llm_json(
+        prompt, system_instruction=SYSTEM_INSTRUCTION,
+        trace_or_span=trace,
+        prompt_name="syllabus_analyser", prompt_version="v1",
+        metadata={"input_length": len(syllabus_text)}
+    )
+

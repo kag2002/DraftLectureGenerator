@@ -1,16 +1,22 @@
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, Field
-from backend.database.session import get_db
+from backend.database.session import get_db, SessionLocal
 from backend.database.models import Course, CLO, User
 from backend.auth import get_current_user
 import shutil
 import os
+import json
 
 router = APIRouter(prefix="/api/courses", tags=["courses"])
 
 # Pydantic schemas
 class CourseCreate(BaseModel):
+    course_code: str = Field(..., example="COMP2010")
+    course_name: str = Field(..., example="Cấu trúc dữ liệu và Giải thuật")
+
+class CourseUpdate(BaseModel):
     course_code: str = Field(..., example="COMP2010")
     course_name: str = Field(..., example="Cấu trúc dữ liệu và Giải thuật")
 
@@ -21,6 +27,7 @@ class CourseResponse(BaseModel):
     
     class Config:
         from_attributes = True
+
 
 class CLOCreate(BaseModel):
     clo_code: str = Field(..., example="CLO1")
@@ -66,6 +73,26 @@ def get_course_detail(course_id: int, current_user: User = Depends(get_current_u
             detail="Môn học không tồn tại hoặc bạn không có quyền truy cập."
         )
     return course
+
+@router.put("/{course_id}", response_model=CourseResponse)
+def update_course(
+    course_id: int,
+    course_data: CourseUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    course = db.query(Course).filter(Course.id == course_id, Course.user_id == current_user.id).first()
+    if not course:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Môn học không tồn tại hoặc bạn không có quyền chỉnh sửa."
+        )
+    course.course_code = course_data.course_code
+    course.course_name = course_data.course_name
+    db.commit()
+    db.refresh(course)
+    return course
+
 
 @router.delete("/{course_id}")
 def delete_course(course_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -240,6 +267,138 @@ def upload_and_parse_syllabus(
             except Exception:
                 pass
 
+@router.post("/{course_id}/parse-syllabus-stream")
+def upload_and_parse_syllabus_stream(
+    course_id: int, 
+    file: UploadFile = File(...), 
+    current_user: User = Depends(get_current_user), 
+    db: Session = Depends(get_db)
+):
+    """
+    Phân tích Syllabus bằng AI và stream tiến độ thời gian thực (SSE) kèm kết quả CLO.
+    """
+    # 1. Kiểm tra quyền sở hữu môn học
+    course = db.query(Course).filter(Course.id == course_id, Course.user_id == current_user.id).first()
+    if not course:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Môn học không tồn tại hoặc bạn không có quyền truy cập."
+        )
+        
+    # 2. Tạo thư mục tạm lưu file
+    temp_dir = "./temp"
+    os.makedirs(temp_dir, exist_ok=True)
+    temp_file_path = os.path.join(temp_dir, file.filename)
+    
+    with open(temp_file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    def event_stream():
+        def send(event: str, data: dict):
+            return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+        new_db = SessionLocal()
+        try:
+            # Stage 1: Đọc tài liệu
+            yield send("stage", {"stage": 1, "message": "📄 Đang trích xuất văn bản từ tài liệu đề cương..."})
+            
+            from backend.utils.parser import parse_document
+            from backend.services.syllabus_analyser import analyse_syllabus
+            
+            text_content = parse_document(temp_file_path)
+            if not text_content:
+                yield send("error", {"message": "Không thể đọc nội dung văn bản từ tài liệu tải lên."})
+                return
+                
+            # Stage 2: AI phân tích
+            yield send("stage", {"stage": 2, "message": "🤖 AI đang bóc tách cấu trúc và chuẩn hóa các chuẩn đầu ra CLO..."})
+            analysis_result = analyse_syllabus(text_content)
+            
+            # Stage 3: Phân cấp mức Bloom
+            yield send("stage", {"stage": 3, "message": "📊 Đang chuẩn hóa động từ hành động và phân cấp mức Bloom..."})
+            
+            # Khôi phục môn học trong session mới
+            new_course = new_db.query(Course).filter(Course.id == course_id).first()
+            if "course_code" in analysis_result and analysis_result["course_code"]:
+                new_course.course_code = analysis_result["course_code"]
+            if "course_name" in analysis_result and analysis_result["course_name"]:
+                new_course.course_name = analysis_result["course_name"]
+                
+            # Stage 4: Lưu trữ vào DB
+            yield send("stage", {"stage": 4, "message": "💾 Đang lưu trữ và đồng bộ hóa danh sách CLOs..."})
+            
+            # Xóa các CLOs cũ của môn này
+            new_db.query(CLO).filter(CLO.course_id == course_id).delete()
+            new_db.commit()
+            
+            raw_clos = analysis_result.get("clos", [])
+            created_clos = []
+            
+            for idx, clo_item in enumerate(raw_clos):
+                new_clo = CLO(
+                    course_id=course_id,
+                    clo_code=clo_item.get("clo_code", f"CLO{idx+1}"),
+                    description=clo_item.get("description", ""),
+                    bloom_level=clo_item.get("bloom_level", 2)
+                )
+                new_db.add(new_clo)
+                new_db.commit()
+                new_db.refresh(new_clo)
+                created_clos.append(new_clo)
+                
+                # Gửi từng CLO vừa lưu xong về client
+                yield send("clo", {
+                    "index": idx + 1,
+                    "total": len(raw_clos),
+                    "clo": {
+                        "id": new_clo.id,
+                        "course_id": new_clo.course_id,
+                        "clo_code": new_clo.clo_code,
+                        "description": new_clo.description,
+                        "bloom_level": new_clo.bloom_level
+                    }
+                })
+                
+            yield send("done", {
+                "message": "✅ Đã phân tích và chuẩn hóa CLOs thành công!",
+                "course": {
+                    "id": new_course.id,
+                    "course_code": new_course.course_code,
+                    "course_name": new_course.course_name
+                },
+                "clos": [
+                    {
+                        "id": c.id,
+                        "course_id": c.course_id,
+                        "clo_code": c.clo_code,
+                        "description": c.description,
+                        "bloom_level": c.bloom_level
+                    }
+                    for c in created_clos
+                ]
+            })
+            
+        except Exception as e:
+            new_db.rollback()
+            yield send("error", {"message": f"Lỗi hệ thống khi phân tích Syllabus: {str(e)}"})
+        finally:
+            new_db.close()
+            # Xóa file tạm
+            if os.path.exists(temp_file_path):
+                try:
+                    os.remove(temp_file_path)
+                except Exception:
+                    pass
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no"
+        }
+    )
+
 # --- API QUẢN LÝ TÀI LIỆU THAM CHIẾU (RAG DOCUMENTS) ---
 
 @router.post("/{course_id}/documents")
@@ -382,4 +541,60 @@ def delete_course_document(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Lỗi khi xóa tài liệu RAG: {str(e)}"
+        )
+
+@router.get("/{course_id}/documents/{file_name}")
+def get_course_document_content(
+    course_id: int,
+    file_name: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    course = db.query(Course).filter(Course.id == course_id, Course.user_id == current_user.id).first()
+    if not course:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Môn học không tồn tại hoặc bạn không có quyền truy cập."
+        )
+        
+    from backend.database.vector_db import collection
+    try:
+        # Lấy tất cả các vector của file_name thuộc môn học này
+        data = collection.get(
+            where={
+                "$and": [
+                    {"user_id": {"$eq": current_user.id}},
+                    {"course_id": {"$eq": course_id}},
+                    {"file_name": {"$eq": file_name}}
+                ]
+            },
+            include=["documents", "metadatas"]
+        )
+        
+        if not data or not data["documents"]:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Tài liệu không tồn tại hoặc không chứa nội dung."
+            )
+            
+        chunks_with_meta = []
+        for i in range(len(data["documents"])):
+            chunks_with_meta.append({
+                "text": data["documents"][i],
+                "page": data["metadatas"][i].get("page_number", 1)
+            })
+            
+        chunks_with_meta.sort(key=lambda x: x["page"])
+        full_text = "\n\n".join([f"--- [Trang {c['page']}] ---\n{c['text']}" for c in chunks_with_meta])
+        
+        return {
+            "file_name": file_name,
+            "content": full_text
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Lỗi khi tải nội dung tài liệu: {str(e)}"
         )
